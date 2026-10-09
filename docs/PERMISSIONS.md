@@ -1,15 +1,16 @@
-# Permission Control Design — MeshCentral MCP
+# Permission Control — MeshCentral MCP
 
-Status: **proposal / not yet implemented**
+Status: **implemented**. Set `MESH_MCP_PROFILE` (default `readonly`); the server
+registers only the tools that profile allows.
 
 ---
 
-## 1. The problem
+## 1. The problem this addresses
 
-The MCP server registers **58 tools unconditionally**. Every one of them is
-handed to the model the moment the server starts, and every one executes against a single
-MeshCentral account supplied through `MESH_USERNAME` / `MESH_PASSWORD`. There is no
-allow-list, no tiering, no confirmation step, no audit trail and no scoping.
+Without a policy, the server would hand the model every tool the moment it starts,
+each executing against a single MeshCentral account — no allow-list, no tiering, no
+confirmation, no scoping. Profiles plus per-tier confirmation give you a graduated
+allow-list; the MeshCentral account itself remains the outer bound (Layer 0 below).
 
 Key risks:
 - Arbitrary code execution as SYSTEM/root on any managed device
@@ -64,6 +65,16 @@ MESH_TOKEN=~t:xxxxxxxxxxxxxxxx,xxxxxxxxxxxxxxxxxxxx
 | `support` | R, RF, W, X | X confirmed |
 | `operations` | R, RF, W, X, WF, P | X, WF, P confirmed |
 | `admin` | all | X, WF, P, A confirmed |
+
+Set the profile with `MESH_MCP_PROFILE`. Adjust it without switching profiles using:
+
+- `MESH_MCP_ENABLE_TOOLS` / `MESH_MCP_DISABLE_TOOLS` — comma-separated tool names to force on/off
+- `MESH_MCP_CONFIRM_TIERS` — comma-separated tiers that require confirmation (overrides the profile default)
+- `MESH_MCP_CONFIRM_MODE` — `auto` (elicitation, else token), `elicit`, `token`, or `off`
+
+Confirmation prefers MCP **elicitation** (a prompt to the human). When the client
+cannot elicit, it falls back to a single-use token **bound to the exact tool
+arguments** — a guard against accidental calls, not a replacement for human review.
 
 ---
 

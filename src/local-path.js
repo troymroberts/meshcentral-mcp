@@ -13,6 +13,8 @@ function isInside(root, target) {
   return rel !== '' && !rel.startsWith('..' + path.sep) && rel !== '..' && !path.isAbsolute(rel);
 }
 
+// Resolve the deepest existing ancestor's real path, so a not-yet-created target
+// is still checked against symlinks on the path that do exist.
 function realpathOfNearestExisting(target) {
   let current = target;
   for (;;) {
@@ -27,17 +29,17 @@ function realpathOfNearestExisting(target) {
   }
 }
 
-export function localFileRoot() {
+// `null` means unrestricted (MESH_LOCAL_FILE_ROOT=*); otherwise the real path of the jail.
+export function localFileRoot(env = process.env) {
   if (resolvedRoot !== undefined) return resolvedRoot;
 
-  const configured = process.env.MESH_LOCAL_FILE_ROOT || DEFAULT_ROOT;
+  const configured = env.MESH_LOCAL_FILE_ROOT || DEFAULT_ROOT;
   if (configured === UNRESTRICTED) {
     if (!warnedUnrestricted) {
       warnedUnrestricted = true;
       console.error(
         '[meshcentral-mcp] WARNING: MESH_LOCAL_FILE_ROOT=* - local file access is unrestricted. ' +
-          'mesh_file_download can write anywhere this process can write, and mesh_file_upload can read ' +
-          'any file it can read.'
+          'mesh_file_download can write anywhere this process can, and mesh_file_upload can read any file it can.'
       );
     }
     resolvedRoot = null;
@@ -50,17 +52,19 @@ export function localFileRoot() {
   return resolvedRoot;
 }
 
-export function resolveLocalPath(rawPath, { mustExist = false } = {}) {
-  if (typeof rawPath !== 'string' || rawPath.length === 0) {
-    throw new Error('A local path is required');
-  }
+// For testing: forget the cached root.
+export function _resetLocalFileRoot() {
+  resolvedRoot = undefined;
+  warnedUnrestricted = false;
+}
 
-  const root = localFileRoot();
+export function resolveLocalPath(rawPath, { mustExist = false, env = process.env } = {}) {
+  if (typeof rawPath !== 'string' || rawPath.length === 0) throw new Error('A local path is required');
+
+  const root = localFileRoot(env);
   if (root === null) {
     const unrestricted = path.resolve(rawPath);
-    if (mustExist && !fs.existsSync(unrestricted)) {
-      throw new Error(`Local file not found: ${unrestricted}`);
-    }
+    if (mustExist && !fs.existsSync(unrestricted)) throw new Error(`Local file not found: ${unrestricted}`);
     return unrestricted;
   }
 
@@ -74,20 +78,14 @@ export function resolveLocalPath(rawPath, { mustExist = false } = {}) {
 
   const realAncestor = realpathOfNearestExisting(resolved);
   if (!isInside(root, realAncestor)) {
-    throw new Error(
-      `Local path '${rawPath}' resolves outside the permitted directory (${root}) via a symbolic link.`
-    );
+    throw new Error(`Local path '${rawPath}' resolves outside the permitted directory (${root}) via a symbolic link.`);
   }
 
   if (mustExist) {
-    if (!fs.existsSync(resolved)) {
-      throw new Error(`Local file not found: ${resolved}`);
-    }
+    if (!fs.existsSync(resolved)) throw new Error(`Local file not found: ${resolved}`);
     const real = fs.realpathSync(resolved);
     if (!isInside(root, real)) {
-      throw new Error(
-        `Local path '${rawPath}' resolves outside the permitted directory (${root}) via a symbolic link.`
-      );
+      throw new Error(`Local path '${rawPath}' resolves outside the permitted directory (${root}) via a symbolic link.`);
     }
     return real;
   }
