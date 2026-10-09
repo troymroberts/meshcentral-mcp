@@ -17,6 +17,7 @@ const CMD_DISPLAY_INFO = 82; // per-display {id, x, y, w, h} records, 10 bytes e
 const CMD_INPUT_LOCK = 87;   // remote input locked (our input is ignored)
 const CMD_JUMBO = 27;        // 8-byte header wrapping a frame larger than 65535 bytes
 const MAX_NOTICES = 20;
+const MONITOR_MS = 12_000;   // re-probe RTT this often; frame cost every 3rd tick
 
 // Image encoding we request from the agent (compression cmd byte 4):
 // 1=JPEG, 2=PNG, 3=TIFF, 4=WebP. We pin JPEG because the tile decoder below is
@@ -59,6 +60,9 @@ export class DesktopSession {
   #rttMs = null;         // last measured host<->server<->agent round-trip (network only)
   #rttWaiters = new Map(); // time -> resolver, for in-flight rtt probes
   #frameCostMs = null;   // measured refresh->full-frame cost (encode + transfer + settle)
+  #monitorTimer = null;  // periodic retune of rtt/frame cost
+  #monitorTick = 0;
+  #capturing = false;    // a real capture is in flight; the monitor stands down
 
   constructor({ id, ws, nodeId, idleMs, onExpire, idleFrameMs = 0 }) {
     this.id = id;
@@ -69,7 +73,7 @@ export class DesktopSession {
     this.#idleMs = idleMs;
     this.#onExpire = onExpire;
     ws.on('message', (d, isBinary) => this.#onMessage(d, isBinary));
-    ws.on('close', () => { this.closed = true; clearTimeout(this.#idleTimer); this.#onExpire?.(this); });
+    ws.on('close', () => { this.closed = true; clearTimeout(this.#idleTimer); this.#stopMonitor(); this.#onExpire?.(this); });
     ws.on('error', () => {});
     this.#arm();
     // Kick off streaming. The agent emits screensize then tiles once unpaused, but
@@ -80,6 +84,7 @@ export class DesktopSession {
     this.#sendUnpause();
     this.requestDisplays();
     this.#primeFrames();
+    this.#startMonitor();
   }
 
   #primeFrames(attempt = 0) {
@@ -166,7 +171,7 @@ export class DesktopSession {
       const d = Date.now() - t0;
       if (best == null || d < best) best = d;
     }
-    this.#frameCostMs = best;
+    this.#applyFrameCost(best); // establishes the first value, which enables the monitor
     return { rttMs: this.#rttMs, frameCostMs: this.#frameCostMs };
   }
 
@@ -198,9 +203,37 @@ export class DesktopSession {
       if (v != null && (best == null || v < best)) best = v;
       await new Promise((r) => setTimeout(r, 60));
     }
-    if (best != null) this.#rttMs = best;
+    if (best != null) this.#applyRtt(best);
     return best;
   }
+
+  // React fast to worse conditions (so capture waits widen immediately), ease back
+  // down slowly as conditions recover. Keeps the live estimates tracking a link
+  // whose latency/bandwidth swings minute to minute.
+  #applyRtt(sample) {
+    if (sample == null) return;
+    this.#rttMs = (this.#rttMs == null || sample > this.#rttMs) ? sample : Math.round(this.#rttMs * 0.7 + sample * 0.3);
+  }
+  #applyFrameCost(sample) {
+    if (sample == null) return;
+    this.#frameCostMs = (this.#frameCostMs == null || sample > this.#frameCostMs) ? sample : Math.round(this.#frameCostMs * 0.7 + sample * 0.3);
+  }
+
+  // Periodically retune while the session is open (network can vary a lot). Cheap
+  // RTT probe each tick; a frame-cost refresh every 3rd tick. Stands down while a
+  // real capture is in flight so it never contends with actual work.
+  #startMonitor() {
+    this.#monitorTimer = setInterval(async () => {
+      if (this.closed) return this.#stopMonitor();
+      if (this.#capturing) return; // never contend with a real capture
+      // RTT only: it's a tiny ctrl echo and rate-independent. Frame cost is learned
+      // passively from real captures (which run at full rate during active use), so
+      // we never sample it while the idle throttle is ramping (that reads falsely high).
+      try { await this.measureRtt(3); } catch { /* transient; retry next tick */ }
+    }, MONITOR_MS);
+    this.#monitorTimer.unref?.();
+  }
+  #stopMonitor() { clearInterval(this.#monitorTimer); this.#monitorTimer = null; }
 
   #parse() {
     while (this.#acc.length >= 4) {
@@ -414,6 +447,7 @@ export class DesktopSession {
   //    `graceMs` and then forces a refresh so a frame is always returned.
   // Keeps the stream at full rate so each refresh is serviced in ~90ms, not ~1.5s.
   capture({ settleMs = 250, minMs = 120, maxMs = 8_000, watch = false, graceMs = 1500 } = {}) {
+    this.#capturing = true; // the monitor stands down while this runs
     this.armRethrottle();
     // Size the waits from measured link conditions so non-ideal links (high RTT,
     // slow encode on a busy screen / slow PC, limited bandwidth) don't conclude
@@ -424,13 +458,20 @@ export class DesktopSession {
     graceMs = Math.max(graceMs, frame + 2 * rtt + 200); // a no-op's forced refresh must have time to return
     maxMs = Math.max(maxMs, frame * 8 + 2000);
     const startTiles = this.#tiles;
+    const wasFull = this.#frameMs === FRAME_MS_ACTIVE; // only a full-rate sample is a valid frame-cost reading
     if (!watch) this.refresh();
     return new Promise((resolve) => {
       let lastTile = 0;
       let forced = !watch;
       const t0 = Date.now();
       const off = this.onTile(() => { lastTile = Date.now(); });
-      const done = () => { off(); clearInterval(iv); this.armRethrottle(); resolve(); };
+      const done = () => {
+        off(); clearInterval(iv); this.#capturing = false;
+        // Passively learn the full-rate refresh->frame cost from plain captures, so the
+        // estimate tracks changing conditions without extra probe traffic.
+        if (!watch && wasFull) this.#applyFrameCost(Date.now() - t0);
+        this.armRethrottle(); resolve();
+      };
       const iv = setInterval(() => {
         const now = Date.now();
         const elapsed = now - t0;
@@ -500,6 +541,7 @@ export class DesktopSession {
   close(reason = 'closed by user') {
     this.closedReason = reason;
     clearTimeout(this.#idleTimer);
+    this.#stopMonitor();
     try { this.#ws.close(); } catch {}
   }
 }
