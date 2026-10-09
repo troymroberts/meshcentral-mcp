@@ -55,6 +55,7 @@ export class DesktopSession {
   #displayInfo = null;   // { id: { x, y, w, h } } from cmd 82
   #frameMs = FRAME_MS_ACTIVE; // frame interval last requested from the agent
   #idleFrameMs;          // interval to use when the agent is the only viewer (0 = never throttle)
+  #rethrottleTimer = null; // fires after a quiet spell to drop back to the idle rate
 
   constructor({ id, ws, nodeId, idleMs, onExpire, idleFrameMs = 0 }) {
     this.id = id;
@@ -311,7 +312,19 @@ export class DesktopSession {
   // Slow the agent's frame rate while we're the only viewer. No-op when a human is
   // co-viewing (they get full-rate video) or when throttling is disabled.
   throttle() {
+    clearTimeout(this.#rethrottleTimer);
+    this.#rethrottleTimer = null;
     if (this.#idleFrameMs > 0 && this.#viewers <= 1) this.#setFrameRate(this.#idleFrameMs);
+  }
+
+  // Stay at full rate now; drop to the idle rate only after a quiet spell. Keeps an
+  // active drive loop (capture every second or two) at full rate the whole time,
+  // so captures are fast, while still saving bandwidth once the agent goes idle.
+  armRethrottle(afterMs = 4000) {
+    this.#setFrameRate(FRAME_MS_ACTIVE);
+    clearTimeout(this.#rethrottleTimer);
+    this.#rethrottleTimer = setTimeout(() => this.throttle(), afterMs);
+    this.#rethrottleTimer.unref?.();
   }
   // "Pause=0": tell the agent to (keep) streaming. We never send pause=1: on some
   // agents (observed on Windows Server 2022) pausing the shared KVM slave and then
@@ -331,14 +344,34 @@ export class DesktopSession {
   // Force a full repaint of the current screen and wait for it to settle, so the
   // returned frame reflects state at/after this call (not a stale earlier frame).
   // Runs at full frame rate for the burst, then re-throttles if we're alone.
-  async capture(waitOpts = {}) {
-    this.#setFrameRate(FRAME_MS_ACTIVE);
-    this.refresh();
-    try {
-      await waitForFrame(this, { settleMs: 500, minMs: 300, maxMs: 8_000, ...waitOpts });
-    } finally {
-      this.throttle();
-    }
+  // Two modes:
+  //  - default (watch=false): a plain screenshot. Force a full repaint now and
+  //    return as soon as it has arrived and settled (~300ms at full rate).
+  //  - watch=true (after an input): do NOT refresh first; wait for the effect's
+  //    own tiles so a fast effect returns quickly and a slow one (app launch) is
+  //    caught when its tiles appear — no fixed guess. Only a genuine no-op waits
+  //    `graceMs` and then forces a refresh so a frame is always returned.
+  // Keeps the stream at full rate so each refresh is serviced in ~90ms, not ~1.5s.
+  capture({ settleMs = 250, minMs = 120, maxMs = 8_000, watch = false, graceMs = 1500 } = {}) {
+    this.armRethrottle();
+    const startTiles = this.#tiles;
+    if (!watch) this.refresh();
+    return new Promise((resolve) => {
+      let lastTile = 0;
+      let forced = !watch;
+      const t0 = Date.now();
+      const off = this.onTile(() => { lastTile = Date.now(); });
+      const done = () => { off(); clearInterval(iv); this.armRethrottle(); resolve(); };
+      const iv = setInterval(() => {
+        const now = Date.now();
+        const elapsed = now - t0;
+        const changed = this.#tiles > startTiles;
+        if (elapsed >= maxMs) return done();
+        if (changed && elapsed >= minMs && now - lastTile >= settleMs) return done();
+        if (!changed && !forced && elapsed >= graceMs) { forced = true; this.refresh(); } // no effect: force one frame
+      }, 30);
+      iv.unref?.();
+    });
   }
 
   // ── Input ───────────────────────────────────────────────────────────────
@@ -507,7 +540,7 @@ export const vkFor = (key) => {
 // repaint first, a fresh tile is guaranteed, so this never resolves on a stale
 // pre-input frame. `requireNew:false` relaxes the fresh-tile requirement (used
 // for the very first frame of a brand-new session, where no refresh preceded).
-export function waitForFrame(session, { settleMs = 600, minMs = 300, maxMs = 8_000, requireNew = true } = {}) {
+export function waitForFrame(session, { settleMs = 250, minMs = 120, maxMs = 8_000, requireNew = true } = {}) {
   return new Promise((resolve) => {
     const started = Date.now();
     const startTiles = session.tilesReceived;
@@ -521,7 +554,7 @@ export function waitForFrame(session, { settleMs = 600, minMs = 300, maxMs = 8_0
       if (elapsed >= maxMs || (elapsed >= minMs && gotNew && quiet)) {
         off(); clearInterval(iv); resolve();
       }
-    }, 80);
+    }, 30);
     iv.unref?.();
   });
 }

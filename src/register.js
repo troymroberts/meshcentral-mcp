@@ -813,16 +813,18 @@ export function registerTools({ server, client, policy, gate, config }) {
         session.close('no frame');
         return errorResult(msg);
       }
-      session.throttle(); // slow the idle stream if we're the only viewer
+      session.armRethrottle(); // stay full rate; drop to idle only after a quiet spell
       return imageResult(session.encodeJpeg({ maxWidth: 1280 }), `Desktop session opened. session_id=${session.id}`, session);
     },
   });
 
   // Let the input land, then stream one full frame (unpause→refresh→settle→re-pause)
   // so the model sees the effect without the device streaming while idle.
-  async function afterInput(session, settle) {
-    await new Promise((r) => setTimeout(r, 150)); // let the input reach the OS before we repaint
-    await session.capture({ minMs: settle, settleMs: 650, maxMs: settle + 6_000 });
+  // Watch for the effect's own tiles rather than waiting a fixed time: a fast
+  // effect (typing) returns in a few hundred ms, a slow one (app launch) is caught
+  // when its tiles appear, and a genuine no-op falls back to a forced refresh.
+  async function afterInput(session) {
+    await session.capture({ watch: true, settleMs: 300, maxMs: 8_000 });
     return session.encodeJpeg({ maxWidth: 1280 });
   }
 
@@ -842,7 +844,7 @@ export function registerTools({ server, client, policy, gate, config }) {
       const s = desktops.get(session_id);
       if (!s.isOpen) return errorResult(`Desktop ${session_id} is closed.`);
       await s.click(x, y, button ?? 'left', double ?? false);
-      return imageResult(await afterInput(s, 1500), `After ${double ? 'double-' : ''}${button ?? 'left'}-click at (${x},${y}):`);
+      return imageResult(await afterInput(s), `After ${double ? 'double-' : ''}${button ?? 'left'}-click at (${x},${y}):`);
     },
   });
 
@@ -875,7 +877,7 @@ export function registerTools({ server, client, policy, gate, config }) {
       const s = desktops.get(session_id);
       if (!s.isOpen) return errorResult(`Desktop ${session_id} is closed.`);
       s.typeText(text);
-      return imageResult(await afterInput(s, 1200), `After typing ${JSON.stringify(text)}:`);
+      return imageResult(await afterInput(s), `After typing ${JSON.stringify(text)}:`);
     },
   });
 
@@ -894,7 +896,7 @@ export function registerTools({ server, client, policy, gate, config }) {
       const { vk, extended } = vkFor(key);
       if (vk == null) return errorResult(`Unknown key '${key}'. Known: ${Object.keys(VK).join(', ')}`);
       s.keyVk(vk, extended);
-      return imageResult(await afterInput(s, 1000), `After pressing ${key}:`);
+      return imageResult(await afterInput(s), `After pressing ${key}:`);
     },
   });
 
@@ -917,7 +919,7 @@ export function registerTools({ server, client, policy, gate, config }) {
       const bad = specs.filter((x) => x.vk == null).map((x) => x.name);
       if (bad.length) return errorResult(`Unknown key(s): ${bad.join(', ')}`);
       s.hotkey(specs);
-      return imageResult(await afterInput(s, 1200), `After ${keys.join('+')}:`, s);
+      return imageResult(await afterInput(s), `After ${keys.join('+')}:`, s);
     },
   });
 
@@ -935,7 +937,7 @@ export function registerTools({ server, client, policy, gate, config }) {
       const s = desktops.get(session_id);
       if (!s.isOpen) return errorResult(`Desktop ${session_id} is closed.`);
       s.scroll(x, y, amount);
-      return imageResult(await afterInput(s, 1000), `After scroll ${amount} at (${x},${y}):`);
+      return imageResult(await afterInput(s), `After scroll ${amount} at (${x},${y}):`);
     },
   });
 
