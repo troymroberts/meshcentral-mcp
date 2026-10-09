@@ -3,8 +3,8 @@ import { z } from 'zod';
 import { resolveLocalPath } from './local-path.js';
 import { FileTunnel, splitRemotePath, joinRemotePath } from './file-tunnel.js';
 import { TerminalManager, waitForOutput, SHELLS } from './terminal.js';
-import { DesktopManager, waitForFrame, vkFor, VK } from './desktop.js';
-import { sanitizeText, textResult, deviceResult, serverResult, errorResult, isServerError } from './safety.js';
+import { DesktopManager, waitForFrame, vkFor, VK, noFrameMessage } from './desktop.js';
+import { sanitizeText, textResult, deviceResult, serverResult, errorResult, isServerError, UNTRUSTED_NOTE } from './safety.js';
 
 // MCP image content from a captured desktop frame.
 function imageResult(enc, header, session = null) {
@@ -14,6 +14,15 @@ function imageResult(enc, header, session = null) {
   if (displays && Object.keys(displays).length > 1) {
     line += `\nDisplays: ${Object.entries(displays).map(([id, name]) => `${id}=${name}`).join(', ')}` +
       `${selected != null ? ` (showing ${selected})` : ''}. Switch with mesh_desktop_set_display.`;
+  }
+  // Agent-side state that changes what input will do. Device-sourced text is
+  // sanitized and fenced like other device output.
+  const notices = session?.takeNotices?.() ?? enc.notices ?? [];
+  if (session?.inputLocked) line += '\nWARNING: remote input is locked on the device; clicks and keystrokes are being ignored.';
+  if (session?.capsLock) line += '\nNote: Caps Lock is on.';
+  if (notices.length) {
+    line += `\n${UNTRUSTED_NOTE}\n<<<DEVICE_OUTPUT\n` +
+      notices.map((n) => `[${n.kind}] ${sanitizeText(n.text)}`).join('\n') + '\nDEVICE_OUTPUT>>>';
   }
   return {
     content: [
@@ -803,8 +812,9 @@ export function registerTools({ server, client, policy, gate, config }) {
       await waitForFrame(session, { requireNew: false, maxMs: 10_000 });
       if (display != null) { session.setDisplay(display); await waitForFrame(session, { maxMs: 6_000 }); }
       if (!session.hasFrame()) {
+        const msg = noFrameMessage(session);
         session.close('no frame');
-        return errorResult('Desktop session opened but no frame was captured (no active console session, or view denied).');
+        return errorResult(msg);
       }
       session.maybePause(); // warm session; keep streaming only if live/co-viewed
       return imageResult(session.encodeJpeg({ maxWidth: 1280 }), `Desktop session opened. session_id=${session.id} (stream=${session.streamMode})`, session);

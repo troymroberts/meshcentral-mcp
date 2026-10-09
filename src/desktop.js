@@ -10,6 +10,13 @@ import jpeg from 'jpeg-js';
 const CMD_TILE = 3;
 const CMD_SCREEN = 7;
 const CMD_DISPLAYS = 11;
+const CMD_MESSAGE = 17;      // MNG_KVM_MESSAGE: text (consent prompts, status)
+const CMD_KEYSTATE = 18;     // NumLock=1, ScrollLock=2, CapsLock=4
+const CMD_ALERT = 65;        // agent error/alert text ('.'-prefixed = debug only)
+const CMD_DISPLAY_INFO = 82; // per-display {id, x, y, w, h} records, 10 bytes each
+const CMD_INPUT_LOCK = 87;   // remote input locked (our input is ignored)
+const CMD_JUMBO = 27;        // 8-byte header wrapping a frame larger than 65535 bytes
+const MAX_NOTICES = 20;
 
 const INPUT = { KEY: 1, MOUSE: 2, CTRLALTDEL: 10, KEYUNICODE: 85 };
 const MOUSE_BTN = { none: 0x00, left: 0x02, right: 0x08, middle: 0x20 };
@@ -33,6 +40,10 @@ export class DesktopSession {
   #streamMode = 'auto';  // 'auto' | 'live' | 'idle'
   #viewers = 1;          // viewers attached to this device's KVM (incl. us), from metadata
   #capturing = false;    // a capture burst is in flight; don't let metadata re-pause mid-capture
+  #notices = [];         // agent alerts/messages not yet reported to the caller
+  #inputLocked = null;   // true when the agent reports remote input is locked
+  #keyState = 0;         // 1 NumLock, 2 ScrollLock, 4 CapsLock
+  #displayInfo = null;   // { id: { x, y, w, h } } from cmd 82
 
   constructor({ id, ws, nodeId, idleMs, onExpire, streamMode = 'auto' }) {
     this.id = id;
@@ -42,7 +53,7 @@ export class DesktopSession {
     this.#idleMs = idleMs;
     this.#onExpire = onExpire;
     this.#streamMode = streamMode;
-    ws.on('message', (d) => this.#onMessage(d));
+    ws.on('message', (d, isBinary) => this.#onMessage(d, isBinary));
     ws.on('close', () => { this.closed = true; clearTimeout(this.#idleTimer); this.#onExpire?.(this); });
     ws.on('error', () => {});
     this.#arm();
@@ -72,6 +83,17 @@ export class DesktopSession {
   get selectedDisplay() { return this.#selectedDisplay; }
   get streamMode() { return this.#streamMode; }
   get viewers() { return this.#viewers; }
+  get inputLocked() { return this.#inputLocked; }
+  get capsLock() { return (this.#keyState & 4) !== 0; }
+  get displayInfo() { return this.#displayInfo; }
+
+  // Return and clear agent alerts/messages received since the last call.
+  takeNotices() { const n = this.#notices; this.#notices = []; return n; }
+
+  #notice(kind, text) {
+    this.#notices.push({ kind, text });
+    if (this.#notices.length > MAX_NOTICES) this.#notices.shift();
+  }
 
   // Keep the video flowing (never idle-pause) when explicitly live, or in auto mode
   // while another viewer (e.g. a human in the MeshCentral UI or a co-viewing bridge)
@@ -91,9 +113,13 @@ export class DesktopSession {
     this.#idleTimer.unref?.();
   }
 
-  #onMessage(data) {
+  // Control JSON arrives as WebSocket *text* frames; KVM commands as *binary*.
+  // Classify by frame type like MeshCentral's own client: sniffing for a leading
+  // '{' would misroute a split binary chunk that happens to start with 0x7B and
+  // desync the stream.
+  #onMessage(data, isBinary) {
     const b = Buffer.isBuffer(data) ? data : Buffer.from(data);
-    if (b.length > 0 && b[0] === 0x7b) { this.#onControl(b); return; } // JSON control frame
+    if (isBinary === false) { this.#onControl(b); return; }
     this.#acc = this.#acc.length ? Buffer.concat([this.#acc, b]) : b;
     this.#parse();
   }
@@ -118,16 +144,73 @@ export class DesktopSession {
     while (this.#acc.length >= 4) {
       const cmd = this.#acc.readUInt16BE(0);
       const size = this.#acc.readUInt16BE(2);
+
+      // Jumbo frame: any command whose payload exceeds the 16-bit size field
+      // (e.g. a full-screen JPEG tile on a busy screen, >65535 bytes) is wrapped
+      // in an 8-byte header [27][8][_][size:24][...]. The real 24-bit length is at
+      // bytes 5-7; the complete inner frame follows the 8-byte header. Missing this
+      // desyncs the whole stream and freezes the framebuffer.
+      if (cmd === CMD_JUMBO && size === 8) {
+        if (this.#acc.length < 8) break;
+        const inner = (this.#acc[5] << 16) | (this.#acc[6] << 8) | this.#acc[7];
+        const total = 8 + inner;
+        if (this.#acc.length < total) break;
+        const frame = this.#acc.subarray(8, total);
+        this.#acc = this.#acc.subarray(total);
+        this.#dispatch(frame.readUInt16BE(0), frame);
+        continue;
+      }
+
       if (size < 4 || this.#acc.length < size) break;
       const frame = this.#acc.subarray(0, size);
       this.#acc = this.#acc.subarray(size);
-      if (cmd === CMD_SCREEN) {
-        this.#onScreen(frame.readUInt16BE(4), frame.readUInt16BE(6));
-      } else if (cmd === CMD_TILE) {
-        this.#onTile(frame.readUInt16BE(4), frame.readUInt16BE(6), frame.subarray(8));
-      } else if (cmd === CMD_DISPLAYS) {
-        this.#onDisplays(frame);
+      this.#dispatch(cmd, frame);
+    }
+  }
+
+  #dispatch(cmd, frame) {
+    switch (cmd) {
+      case CMD_TILE:
+        if (frame.length >= 8) this.#onTile(frame.readUInt16BE(4), frame.readUInt16BE(6), frame.subarray(8));
+        break;
+      case CMD_SCREEN:
+        if (frame.length >= 8) this.#onScreen(frame.readUInt16BE(4), frame.readUInt16BE(6));
+        break;
+      case CMD_DISPLAYS:
+        if (frame.length >= 6) this.#onDisplays(frame);
+        break;
+      case CMD_MESSAGE:
+        this.#notice('message', frame.subarray(4).toString('utf8'));
+        break;
+      case CMD_ALERT: {
+        const text = frame.subarray(4).toString('utf8');
+        if (!text.startsWith('.')) this.#notice('alert', text); // '.'-prefixed alerts are debug noise
+        break;
       }
+      case CMD_KEYSTATE:
+        if (frame.length === 5) this.#keyState = frame[4];
+        break;
+      case CMD_INPUT_LOCK:
+        if (frame.length === 5) {
+          const locked = frame[4] !== 0;
+          if (locked && this.#inputLocked !== true) this.#notice('input-lock', 'Remote input is locked on the device; mouse and keyboard input will be ignored.');
+          this.#inputLocked = locked;
+        }
+        break;
+      case CMD_DISPLAY_INFO:
+        if (frame.length >= 4 && (frame.length - 4) % 10 === 0) {
+          const info = {};
+          for (let p = 4; p < frame.length; p += 10) {
+            info[frame.readUInt16BE(p)] = {
+              x: frame.readUInt16BE(p + 2), y: frame.readUInt16BE(p + 4),
+              w: frame.readUInt16BE(p + 6), h: frame.readUInt16BE(p + 8),
+            };
+          }
+          this.#displayInfo = info;
+        }
+        break;
+      default:
+        break; // cursor shape (88), touch (14/15), set-display ack (12): not needed
     }
   }
 
@@ -151,6 +234,14 @@ export class DesktopSession {
     // Re-assert streaming settings after a resize, mirroring the web client.
     this.#sendCompression();
     this.#sendUnpause();
+    this.releaseModifiers();
+  }
+
+  // Send key-up for Shift/Ctrl/Alt/Win so a chord interrupted mid-press can't
+  // leave a modifier held and corrupt every later keystroke (the web client does
+  // this on every screen-size change).
+  releaseModifiers() {
+    for (const vk of [0x10, 0x11, 0x12, 0x5b, 0x5c]) this.#send(Buffer.from([0, INPUT.KEY, 0, 6, 1, vk]));
   }
 
   #onTile(x, y, jpegData) {
@@ -362,10 +453,11 @@ export class DesktopManager {
     try {
       if (opts.display != null) session.setDisplay(opts.display);
       await waitForFrame(session, { requireNew: false, maxMs: 10_000 });
-      if (!session.hasFrame()) throw new Error('No desktop frame received (no active console session to capture, or view denied).');
+      if (!session.hasFrame()) throw new Error(noFrameMessage(session));
       const enc = session.encodeJpeg(opts);
       enc.displays = session.displays;
       enc.selectedDisplay = session.selectedDisplay;
+      enc.notices = session.takeNotices();
       return enc;
     } finally {
       session.close();
@@ -376,6 +468,15 @@ export class DesktopManager {
     for (const s of this.#sessions.values()) s.close('server shutdown');
     this.#sessions.clear();
   }
+}
+
+// Explain a missing frame using what the agent actually reported, if anything.
+export function noFrameMessage(session) {
+  const notices = session.takeNotices();
+  const said = notices.map((n) => n.text).filter(Boolean).join('; ');
+  return said
+    ? `No desktop frame received. Agent reported: ${said}`
+    : 'No desktop frame received (no active console session to capture, view denied, or another viewer holding the desktop).';
 }
 
 export const vkFor = (key) => {

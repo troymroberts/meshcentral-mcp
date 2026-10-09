@@ -11,7 +11,25 @@ import {
 } from '../src/safety.js';
 import { splitRemotePath, joinRemotePath, isWindowsPath } from '../src/file-tunnel.js';
 import { resolveLocalPath, _resetLocalFileRoot } from '../src/local-path.js';
-import { vkFor, VK } from '../src/desktop.js';
+import { vkFor, VK, DesktopSession } from '../src/desktop.js';
+
+// Minimal fake relay socket for driving the KVM frame parser.
+function fakeWs() {
+  const h = {};
+  return {
+    readyState: 1,
+    on(ev, fn) { (h[ev] ||= []).push(fn); },
+    off() {}, send() {}, close() {},
+    feed(buf, isBinary = true) { (h.message || []).forEach((fn) => fn(buf, isBinary)); },
+  };
+}
+function mkSession(ws) {
+  return new DesktopSession({ id: 't', ws, nodeId: 'n', idleMs: 60_000, onExpire() {} });
+}
+const frame = (cmd, payload = Buffer.alloc(0)) => {
+  const size = 4 + payload.length;
+  return Buffer.concat([Buffer.from([(cmd >> 8) & 0xff, cmd & 0xff, (size >> 8) & 0xff, size & 0xff]), payload]);
+};
 
 test('parseEnvFile handles quotes, comments, export', () => {
   const env = parseEnvFile('export A=1\nB="two words" # c\nC=\'x\'\n# comment\nD=\n');
@@ -134,6 +152,61 @@ test('resolveLocalPath confines to the jail and blocks traversal', () => {
   assert.throws(() => resolveLocalPath('../escape.txt', { env }), /outside the permitted directory/);
   assert.throws(() => resolveLocalPath('/etc/passwd', { env }), /outside the permitted directory/);
   _resetLocalFileRoot();
+});
+
+test('KVM parser routes control frames by type, not a leading-brace sniff', () => {
+  const ws = fakeWs();
+  const s = mkSession(ws);
+  // input lock (cmd 87), caps-lock keystate (cmd 18), display list (cmd 11)
+  ws.feed(frame(87, Buffer.from([1])));
+  ws.feed(frame(18, Buffer.from([4])));
+  ws.feed(frame(11, Buffer.from([0, 2, 0, 0, 0, 1, 0, 1]))); // dcount=2, ids 0&1, selected=1
+  assert.equal(s.inputLocked, true);
+  assert.equal(s.capsLock, true);
+  assert.deepEqual(Object.keys(s.displays), ['0', '1']);
+  assert.equal(s.selectedDisplay, 1);
+  s.close();
+});
+
+test('KVM parser surfaces agent alert/message text, skips debug dot-alerts', () => {
+  const ws = fakeWs();
+  const s = mkSession(ws);
+  ws.feed(frame(65, Buffer.from('No active session', 'utf8')));
+  ws.feed(frame(65, Buffer.from('.debug noise', 'utf8')));
+  ws.feed(frame(17, Buffer.from('Consent requested', 'utf8')));
+  const notices = s.takeNotices();
+  const texts = notices.map((n) => n.text);
+  assert.ok(texts.includes('No active session'));
+  assert.ok(texts.includes('Consent requested'));
+  assert.ok(!texts.some((t) => t.includes('debug noise')));
+  assert.equal(s.takeNotices().length, 0, 'takeNotices clears');
+  s.close();
+});
+
+test('KVM parser handles a jumbo frame and stays synced for the next frame', () => {
+  const ws = fakeWs();
+  const s = mkSession(ws);
+  // Jumbo-wrapped tile (bad JPEG, decode fails silently) immediately followed by
+  // an input-lock frame. If jumbo framing is wrong, the next frame is mis-parsed.
+  const inner = Buffer.concat([Buffer.from([0, 3, 0, 0, 0, 10, 0, 20]), Buffer.alloc(100, 0x55)]); // cmd 3, X=10 Y=20, 100 bytes
+  const len = inner.length;
+  const jumbo = Buffer.concat([Buffer.from([0, 27, 0, 8, 0, (len >> 16) & 0xff, (len >> 8) & 0xff, len & 0xff]), inner]);
+  ws.feed(Buffer.concat([jumbo, frame(87, Buffer.from([1]))]));
+  assert.equal(s.inputLocked, true, 'frame after jumbo was parsed -> no desync');
+  s.close();
+});
+
+test('KVM parser waits for a split jumbo frame to complete', () => {
+  const ws = fakeWs();
+  const s = mkSession(ws);
+  const inner = Buffer.concat([Buffer.from([0, 82, 0, 0]), Buffer.from([0, 0, 0, 0, 0, 100, 0, 50, 0, 0])]); // cmd 82 display-info, 1 record
+  const len = inner.length;
+  const jumbo = Buffer.concat([Buffer.from([0, 27, 0, 8, 0, 0, 0, len]), inner]);
+  ws.feed(jumbo.subarray(0, 10)); // first chunk
+  assert.equal(s.displayInfo, null, 'incomplete jumbo not yet processed');
+  ws.feed(jumbo.subarray(10));    // remainder
+  assert.deepEqual(s.displayInfo, { 0: { x: 0, y: 100, w: 50, h: 0 } });
+  s.close();
 });
 
 test('vkFor maps key names to VK codes and marks extended keys', () => {
