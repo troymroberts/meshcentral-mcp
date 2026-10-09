@@ -56,6 +56,9 @@ export class DesktopSession {
   #frameMs = FRAME_MS_ACTIVE; // frame interval last requested from the agent
   #idleFrameMs;          // interval to use when the agent is the only viewer (0 = never throttle)
   #rethrottleTimer = null; // fires after a quiet spell to drop back to the idle rate
+  #rttMs = null;         // last measured host<->server<->agent round-trip (network only)
+  #rttWaiters = new Map(); // time -> resolver, for in-flight rtt probes
+  #frameCostMs = null;   // measured refresh->full-frame cost (encode + transfer + settle)
 
   constructor({ id, ws, nodeId, idleMs, onExpire, idleFrameMs = 0 }) {
     this.id = id;
@@ -138,7 +141,65 @@ export class DesktopSession {
       } else {
         this.throttle(); // back to agent-only: slow the stream down again
       }
+    } else if (msg.type === 'rtt' && typeof msg.time === 'number') {
+      // Echo of our own rtt probe (round-tripped through the server to the agent).
+      const resolve = this.#rttWaiters.get(msg.time);
+      if (resolve) { this.#rttWaiters.delete(msg.time); resolve(); }
     }
+  }
+
+  // Round-trip latency host -> server -> agent -> back (ms). Measures the network
+  // path, not the agent's encode time. null until first measured.
+  get rttMs() { return this.#rttMs; }
+  // Measured cost of one refresh -> full frame (encode + transfer + settle), ms.
+  get frameCostMs() { return this.#frameCostMs; }
+
+  // Measure the link so capture() can size its waits for non-ideal conditions:
+  // network RTT (host<->agent) and a sample full-frame cost (encode+transfer).
+  async calibrate() {
+    await this.capture({ minMs: 0, settleMs: 120 }); // warm up tunnel/slave + drain initial frames; discard
+    await this.measureRtt();                         // probe RTT once the stream is quiet
+    let best = null;
+    for (let i = 0; i < 3; i++) {                     // min of a few refreshes = least-contended frame cost
+      const t0 = Date.now();
+      await this.capture({ minMs: 0, settleMs: 120 });
+      const d = Date.now() - t0;
+      if (best == null || d < best) best = d;
+    }
+    this.#frameCostMs = best;
+    return { rttMs: this.#rttMs, frameCostMs: this.#frameCostMs };
+  }
+
+  // Rough per-action latency budget for the current link (what a capture costs).
+  estimatedActionMs() {
+    const frame = this.#frameCostMs ?? 300;
+    return Math.round(frame + (this.#rttMs || 0));
+  }
+
+  #rttProbe(timeoutMs = 3000) {
+    if (!this.isOpen) return Promise.resolve(null);
+    const time = Date.now() + Math.random(); // unique key even for back-to-back probes
+    const sendTime = Date.now();
+    return new Promise((resolve) => {
+      const finish = (v) => { this.#rttWaiters.delete(time); resolve(v); };
+      this.#rttWaiters.set(time, () => finish(Date.now() - sendTime));
+      const timer = setTimeout(() => finish(null), timeoutMs);
+      timer.unref?.();
+      try { this.#ws.send(JSON.stringify({ ctrlChannel: '102938', type: 'rtt', time })); } catch { finish(null); }
+    });
+  }
+
+  // Take the MIN of several probes: a probe queued behind a frame transfer on the
+  // same socket reads high, so the minimum best reflects the true network RTT.
+  async measureRtt(samples = 4) {
+    let best = null;
+    for (let i = 0; i < samples; i++) {
+      const v = await this.#rttProbe();
+      if (v != null && (best == null || v < best)) best = v;
+      await new Promise((r) => setTimeout(r, 60));
+    }
+    if (best != null) this.#rttMs = best;
+    return best;
   }
 
   #parse() {
@@ -354,6 +415,14 @@ export class DesktopSession {
   // Keeps the stream at full rate so each refresh is serviced in ~90ms, not ~1.5s.
   capture({ settleMs = 250, minMs = 120, maxMs = 8_000, watch = false, graceMs = 1500 } = {}) {
     this.armRethrottle();
+    // Size the waits from measured link conditions so non-ideal links (high RTT,
+    // slow encode on a busy screen / slow PC, limited bandwidth) don't conclude
+    // "no change" or time out prematurely. All no-ops locally (rtt ~2ms).
+    const rtt = this.#rttMs || 0;
+    const frame = this.#frameCostMs || 0;
+    settleMs += rtt;
+    graceMs = Math.max(graceMs, frame + 2 * rtt + 200); // a no-op's forced refresh must have time to return
+    maxMs = Math.max(maxMs, frame * 8 + 2000);
     const startTiles = this.#tiles;
     if (!watch) this.refresh();
     return new Promise((resolve) => {
@@ -469,7 +538,7 @@ export class DesktopManager {
     return [...this.#sessions.values()].map((s) => ({
       session_id: s.id, node_id: s.nodeId, open: s.isOpen,
       width: s.width, height: s.height, tiles: s.tilesReceived,
-      viewers: s.viewers, frame_ms: s.frameMs,
+      viewers: s.viewers, frame_ms: s.frameMs, rtt_ms: s.rttMs, frame_cost_ms: s.frameCostMs,
       display: s.selectedDisplay, displays: s.displays,
       age_seconds: Math.round((Date.now() - s.createdAt) / 1000),
     }));

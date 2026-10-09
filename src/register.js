@@ -814,7 +814,11 @@ export function registerTools({ server, client, policy, gate, config }) {
         return errorResult(msg);
       }
       session.armRethrottle(); // stay full rate; drop to idle only after a quiet spell
-      return imageResult(session.encodeJpeg({ maxWidth: 1280 }), `Desktop session opened. session_id=${session.id}`, session);
+      const cal = await session.calibrate(); // measure RTT + frame cost; sizes capture waits
+      const calNote = cal.rttMs != null
+        ? ` Link: RTT ~${cal.rttMs}ms, frame ~${cal.frameCostMs}ms, est. ~${session.estimatedActionMs()}ms per captured action.`
+        : '';
+      return imageResult(session.encodeJpeg({ maxWidth: 1280 }), `Desktop session opened. session_id=${session.id}.${calNote}`, session);
     },
   });
 
