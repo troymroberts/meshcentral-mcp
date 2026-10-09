@@ -64,6 +64,11 @@ function shutdown() {
 }
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
+// A stdio MCP server's lifetime is tied to its client: when stdin closes (client
+// gone), shut down so we don't leak the MeshCentral connection and any open
+// terminal/desktop tunnels.
+process.stdin.on('end', shutdown);
+process.stdin.on('close', shutdown);
 
 async function main() {
   try {

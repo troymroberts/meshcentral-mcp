@@ -773,7 +773,7 @@ export function registerTools({ server, client, policy, gate, config }) {
       const maxWidth = max_width ?? 1280;
       if (session_id) {
         const s = desktops.get(session_id);
-        await s.capture({ firstMs: 6_000 }); // burst if idle-paused; freshen if live
+        await s.capture({ maxMs: 8_000 }); // burst if idle-paused; freshen if live
         if (!s.hasFrame()) return errorResult('No frame available for that session yet.');
         return imageResult(s.encodeJpeg({ maxWidth }), `Desktop (session ${session_id}):`, s);
       }
@@ -800,8 +800,8 @@ export function registerTools({ server, client, policy, gate, config }) {
     },
     handler: async ({ node_id, display, stream }) => {
       const session = await desktops.open(await resolveNodeId(node_id), { streamMode: stream ?? 'auto' });
-      await waitForFrame(session);
-      if (display != null) { session.setDisplay(display); await waitForFrame(session, { firstMs: 5_000 }); }
+      await waitForFrame(session, { requireNew: false, maxMs: 10_000 });
+      if (display != null) { session.setDisplay(display); await waitForFrame(session, { maxMs: 6_000 }); }
       if (!session.hasFrame()) {
         session.close('no frame');
         return errorResult('Desktop session opened but no frame was captured (no active console session, or view denied).');
@@ -814,8 +814,8 @@ export function registerTools({ server, client, policy, gate, config }) {
   // Let the input land, then stream one full frame (unpause→refresh→settle→re-pause)
   // so the model sees the effect without the device streaming while idle.
   async function afterInput(session, settle) {
-    await new Promise((r) => setTimeout(r, 150));
-    await session.capture({ firstMs: settle, quietMs: 600, maxMs: settle + 4_000 });
+    await new Promise((r) => setTimeout(r, 150)); // let the input reach the OS before we repaint
+    await session.capture({ minMs: settle, settleMs: 650, maxMs: settle + 6_000 });
     return session.encodeJpeg({ maxWidth: 1280 });
   }
 
@@ -834,7 +834,7 @@ export function registerTools({ server, client, policy, gate, config }) {
     handler: async ({ session_id, x, y, button, double }) => {
       const s = desktops.get(session_id);
       if (!s.isOpen) return errorResult(`Desktop ${session_id} is closed.`);
-      s.click(x, y, button ?? 'left', double ?? false);
+      await s.click(x, y, button ?? 'left', double ?? false);
       return imageResult(await afterInput(s, 1500), `After ${double ? 'double-' : ''}${button ?? 'left'}-click at (${x},${y}):`);
     },
   });
@@ -892,6 +892,29 @@ export function registerTools({ server, client, policy, gate, config }) {
   });
 
   define({
+    name: 'mesh_desktop_hotkey', tier: 'X', title: 'Desktop hotkey',
+    description:
+      'Press a key chord in a desktop session (modifiers held while the final key is pressed), then screenshot. ' +
+      'Give keys in order, e.g. ["ctrl","s"], ["alt","f4"], ["ctrl","shift","escape"], ["win","d"]. ' +
+      'Modifiers: ctrl, alt, shift, win. Other keys: single characters or names (enter, tab, f4, delete, ...).',
+    annotations: { destructiveHint: true },
+    confirmSummary: ({ session_id, keys }) => `Press ${keys.join('+')} in desktop ${session_id}`,
+    schema: {
+      session_id: z.string().describe('Session ID'),
+      keys: z.array(z.string()).min(1).describe('Keys in press order; modifiers first (e.g. ["ctrl","s"])'),
+    },
+    handler: async ({ session_id, keys }) => {
+      const s = desktops.get(session_id);
+      if (!s.isOpen) return errorResult(`Desktop ${session_id} is closed.`);
+      const specs = keys.map((k) => ({ name: k, ...vkFor(k) }));
+      const bad = specs.filter((x) => x.vk == null).map((x) => x.name);
+      if (bad.length) return errorResult(`Unknown key(s): ${bad.join(', ')}`);
+      s.hotkey(specs);
+      return imageResult(await afterInput(s, 1200), `After ${keys.join('+')}:`, s);
+    },
+  });
+
+  define({
     name: 'mesh_desktop_scroll', tier: 'X', title: 'Desktop scroll',
     description: 'Scroll the mouse wheel at native pixel coordinates (positive = up), then screenshot.',
     annotations: { destructiveHint: true },
@@ -920,7 +943,7 @@ export function registerTools({ server, client, policy, gate, config }) {
       const s = desktops.get(session_id);
       if (!s.isOpen) return errorResult(`Desktop ${session_id} is closed.`);
       s.setDisplay(display);
-      await s.capture({ firstMs: 5_000 });
+      await s.capture({ maxMs: 6_000 });
       return imageResult(s.encodeJpeg({ maxWidth: 1280 }), `Switched to display ${display}:`, s);
     },
   });

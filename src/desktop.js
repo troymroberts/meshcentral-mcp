@@ -46,10 +46,21 @@ export class DesktopSession {
     ws.on('close', () => { this.closed = true; clearTimeout(this.#idleTimer); this.#onExpire?.(this); });
     ws.on('error', () => {});
     this.#arm();
-    // Kick off streaming (the agent emits screensize first, then tiles once unpaused).
+    // Kick off streaming. The agent emits screensize then tiles once unpaused, but
+    // if a KVM slave is already running (another viewer attached) a newly joined
+    // tunnel gets no keyframe on a static screen, and a refresh sent before the
+    // slave has attached is dropped. So re-send refresh until the first tile lands.
     this.#sendCompression();
     this.#sendUnpause();
     this.requestDisplays();
+    this.#primeFrames();
+  }
+
+  #primeFrames(attempt = 0) {
+    if (this.closed || this.#tiles > 0 || attempt > 8) return;
+    this.refresh();
+    const timer = setTimeout(() => this.#primeFrames(attempt + 1), 600);
+    timer.unref?.();
   }
 
   get isOpen() { return !this.closed && this.#ws.readyState === 1; }
@@ -198,10 +209,15 @@ export class DesktopSession {
   // for an observe→act→observe loop we keep the session warm but idle-paused and
   // only stream during a capture. This stops the device encoding frames nobody is
   // watching (the main efficiency win, especially over WAN).
-  pause() { if (!this.#paused) { this.#paused = true; this.#send(Buffer.from([0, 8, 0, 5, 1])); } }
-  unpause() { if (this.#paused) { this.#paused = false; this.#send(Buffer.from([0, 8, 0, 5, 0])); } }
-  // Pause only when nobody else needs the live stream.
-  maybePause() { if (!this.shouldStayLive()) this.pause(); }
+  // NOTE: Pausing the KVM stream (cmd 8 pause=1) is DISABLED. On some agents
+  // (observed on Windows Server 2022) pausing the shared remote-desktop slave and
+  // then disconnecting leaves the slave wedged (it emits screen-size but no tiles)
+  // for every subsequent viewer until the agent is restarted. The bandwidth saving
+  // is not worth wedging a shared resource, so idle sessions keep the stream live;
+  // to truly stop the device stream, close the session instead.
+  pause() { /* intentionally a no-op; see note above */ }
+  unpause() { if (this.#paused) { this.#paused = false; } this.#send(Buffer.from([0, 8, 0, 5, 0])); }
+  maybePause() { /* no-op: never pause the shared slave */ }
 
   requestDisplays() { this.#send(Buffer.from([0, 0x0b, 0, 4])); }
 
@@ -213,18 +229,16 @@ export class DesktopSession {
   // Produce a fresh, settled frame. When idle-paused, this is a burst
   // (unpause → full repaint → settle → re-pause). When live (human watching),
   // the stream is already current, so just freshen and leave it running.
+  // Force a full repaint of the current screen and wait for it to settle, so the
+  // returned frame reflects state at/after this call (not a stale earlier frame).
   async capture(waitOpts = {}) {
     this.#capturing = true;
     try {
-      if (this.#paused) {
-        this.unpause();
-        this.refresh();
-        await waitForFrame(this, waitOpts);
-        this.maybePause();
-      } else {
-        this.refresh();
-        await waitForFrame(this, { quietMs: 400, firstMs: 1_500, maxMs: 4_000, ...waitOpts });
-      }
+      const wasPaused = this.#paused;
+      if (wasPaused) this.unpause();
+      this.refresh();
+      await waitForFrame(this, { settleMs: 500, minMs: 300, maxMs: 8_000, ...waitOpts });
+      if (wasPaused) this.maybePause();
     } finally {
       this.#capturing = false;
     }
@@ -235,12 +249,22 @@ export class DesktopSession {
 
   move(x, y) { this.#mouse(MOUSE_BTN.none, x, y); }
 
-  click(x, y, button = 'left', double = false) {
+  // Small gaps so Windows registers a real press and a real double-click
+  // (back-to-back events can collapse into a single click).
+  async click(x, y, button = 'left', double = false) {
     const b = MOUSE_BTN[button] ?? MOUSE_BTN.left;
+    const gap = (ms) => new Promise((r) => setTimeout(r, ms));
     this.move(x, y);
-    this.#mouse(b, x, y);              // down
-    this.#mouse((b * 2) & 0xff, x, y); // up
-    if (double) { this.#mouse(b, x, y); this.#mouse((b * 2) & 0xff, x, y); }
+    await gap(40);
+    this.#mouse(b, x, y);               // press
+    await gap(40);
+    this.#mouse((b * 2) & 0xff, x, y);  // release
+    if (double) {
+      await gap(90);
+      this.#mouse(b, x, y);
+      await gap(40);
+      this.#mouse((b * 2) & 0xff, x, y);
+    }
   }
 
   scroll(x, y, delta) {
@@ -260,6 +284,16 @@ export class DesktopSession {
   keyVk(vk, extended = false) {
     this.#send(Buffer.from([0, INPUT.KEY, 0, 6, extended ? 3 : 0, vk])); // down
     this.#send(Buffer.from([0, INPUT.KEY, 0, 6, extended ? 4 : 1, vk])); // up
+  }
+
+  // Press a chord: hold each key down in order, then release in reverse
+  // (e.g. Ctrl+S, Alt+F4). specs: [{ vk, extended }].
+  hotkey(specs) {
+    for (const s of specs) this.#send(Buffer.from([0, INPUT.KEY, 0, 6, s.extended ? 3 : 0, s.vk]));
+    for (let i = specs.length - 1; i >= 0; i--) {
+      const s = specs[i];
+      this.#send(Buffer.from([0, INPUT.KEY, 0, 6, s.extended ? 4 : 1, s.vk]));
+    }
   }
 
   ctrlAltDel() { this.#send(Buffer.from([0, INPUT.CTRLALTDEL, 0, 4])); }
@@ -327,7 +361,7 @@ export class DesktopManager {
     const session = new DesktopSession({ id: 'oneshot', ws, nodeId, idleMs: 60_000, onExpire: () => {} });
     try {
       if (opts.display != null) session.setDisplay(opts.display);
-      await waitForFrame(session, opts);
+      await waitForFrame(session, { requireNew: false, maxMs: 10_000 });
       if (!session.hasFrame()) throw new Error('No desktop frame received (no active console session to capture, or view denied).');
       const enc = session.encodeJpeg(opts);
       enc.displays = session.displays;
@@ -346,17 +380,39 @@ export class DesktopManager {
 
 export const vkFor = (key) => {
   const k = String(key).toLowerCase();
-  return { vk: VK[k], extended: EXTENDED.has(k) };
+  if (VK[k] != null) return { vk: VK[k], extended: EXTENDED.has(k) };
+  // Single character: letters/digits map to their uppercase char code (VK = ASCII upper).
+  if (String(key).length === 1) {
+    const vk = String(key).toUpperCase().charCodeAt(0);
+    if ((vk >= 0x30 && vk <= 0x39) || (vk >= 0x41 && vk <= 0x5a)) return { vk, extended: false };
+  }
+  return { vk: undefined, extended: false };
 };
 
 // Resolve once tiles stop arriving for quietMs after the first frame, or maxMs elapses.
-export function waitForFrame(session, { quietMs = 700, firstMs = 8_000, maxMs = 15_000 } = {}) {
+// Wait for a settled frame that postdates the call. Resolves once:
+//   - at least `minMs` has elapsed (let a slow effect begin), AND
+//   - at least one new tile has arrived since the call (so the frame is fresh), AND
+//   - no tile has arrived for `settleMs` (the screen has stopped changing);
+// or `maxMs` elapses as a hard ceiling. Because every capture forces a full
+// repaint first, a fresh tile is guaranteed, so this never resolves on a stale
+// pre-input frame. `requireNew:false` relaxes the fresh-tile requirement (used
+// for the very first frame of a brand-new session, where no refresh preceded).
+export function waitForFrame(session, { settleMs = 600, minMs = 300, maxMs = 8_000, requireNew = true } = {}) {
   return new Promise((resolve) => {
-    let timer;
-    const done = () => { off(); clearTimeout(timer); clearTimeout(hard); resolve(); };
-    const off = session.onTile(() => { clearTimeout(timer); timer = setTimeout(done, quietMs); });
-    timer = setTimeout(done, firstMs);
-    const hard = setTimeout(done, maxMs);
-    timer.unref?.(); hard.unref?.();
+    const started = Date.now();
+    const startTiles = session.tilesReceived;
+    let lastTile = 0;
+    const off = session.onTile(() => { lastTile = Date.now(); });
+    const iv = setInterval(() => {
+      const now = Date.now();
+      const elapsed = now - started;
+      const gotNew = !requireNew || session.tilesReceived > startTiles;
+      const quiet = lastTile !== 0 && now - lastTile >= settleMs;
+      if (elapsed >= maxMs || (elapsed >= minMs && gotNew && quiet)) {
+        off(); clearInterval(iv); resolve();
+      }
+    }, 80);
+    iv.unref?.();
   });
 }
