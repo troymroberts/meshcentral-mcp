@@ -683,15 +683,20 @@ export function registerTools({ server, client, policy, gate, config }) {
     handler: async ({ session_id, input, submit, wait_ms }) => {
       const session = terminals.get(session_id);
       if (!session.isOpen) return errorResult(`Terminal ${session_id} is closed (${session.closedReason || 'unknown'}).`);
-      const chunks = [];
-      const off = session.onData((b) => chunks.push(b));
-      try {
-        session.send(submit === false ? input : input + '\r');
-        await waitForOutput(session, { quietMs: 800, maxMs: wait_ms ?? 15_000 });
-      } finally {
-        off();
-      }
-      const delta = sanitizeText(Buffer.concat(chunks).toString('utf8'));
+      const before = session.renderedLines();
+      session.send(submit === false ? input : input + '\r');
+      await waitForOutput(session, { quietMs: 800, maxMs: wait_ms ?? 15_000 });
+      const after = session.renderedLines();
+
+      // Return the rendered-screen delta: the lines appended since the input. xterm
+      // has already collapsed interactive redraws, so this is clean for CMD, bash,
+      // and PowerShell/PSReadLine alike. Back up one line to include the prompt the
+      // command was typed on, for context.
+      const limit = Math.min(before.length, after.length);
+      let common = 0;
+      while (common < limit && before[common] === after[common]) common++;
+      if (common > 0) common -= 1;
+      const delta = after.slice(common).join('\n').replace(/\n{3,}/g, '\n\n').trim();
       return deviceResult(delta || '(no new output)', `Terminal ${session_id} output:`);
     },
   });

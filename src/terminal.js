@@ -103,15 +103,22 @@ export class TerminalSession {
     return sanitizeText(lines.join('\n').replace(/\s+$/, ''));
   }
 
-  // Full scrollback + screen as plain text.
-  transcript() {
+  // Every rendered line (scrollback + screen), right-trimmed. Used for transcript
+  // and for computing clean input deltas (xterm has already resolved cursor moves
+  // and line redraws such as PowerShell's PSReadLine).
+  renderedLines() {
     const buf = this.#term.buffer.active;
     const lines = [];
     for (let i = 0; i < buf.length; i++) {
       const line = buf.getLine(i);
-      lines.push(line ? line.translateToString(true) : '');
+      lines.push(sanitizeText(line ? line.translateToString(true) : '').replace(/\s+$/, ''));
     }
-    return sanitizeText(lines.join('\n').replace(/[ \t]+$/gm, '').replace(/\n{3,}/g, '\n\n').trim());
+    return lines;
+  }
+
+  // Full scrollback + screen as plain text.
+  transcript() {
+    return this.renderedLines().join('\n').replace(/\n{3,}/g, '\n\n').trim();
   }
 
   rawBytes() { return this.#rawBytes; }
