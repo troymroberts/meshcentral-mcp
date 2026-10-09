@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { resolveLocalPath } from './local-path.js';
 import { FileTunnel, splitRemotePath, joinRemotePath } from './file-tunnel.js';
 import { TerminalManager, waitForOutput, SHELLS } from './terminal.js';
-import { DesktopManager, waitForFrame, vkFor, VK, noFrameMessage } from './desktop.js';
+import { DesktopManager, waitForFrame, vkFor, VK, noFrameMessage, DEFAULT_MAX_WIDTH } from './desktop.js';
 import { sanitizeText, textResult, deviceResult, serverResult, errorResult, isServerError, UNTRUSTED_NOTE } from './safety.js';
 
 // MCP image content from a captured desktop frame.
@@ -777,10 +777,10 @@ export function registerTools({ server, client, policy, gate, config }) {
       node_id: z.string().optional().describe('Device node ID or name (for a one-off capture; must be online)'),
       session_id: z.string().optional().describe('Open desktop session to re-capture instead'),
       display: z.number().int().optional().describe('Display/monitor number to capture (one-off only; 65535 = all). Omit for the current one.'),
-      max_width: z.number().int().positive().optional().describe('Downscale so width <= this (default 1280; use native width to disable)'),
+      max_width: z.number().int().positive().optional().describe('Downscale so width <= this (default 960; pass a larger value (up to native 1920) to read fine print)'),
     },
     handler: async ({ node_id, session_id, display, max_width }) => {
-      const maxWidth = max_width ?? 1280;
+      const maxWidth = max_width ?? DEFAULT_MAX_WIDTH;
       if (session_id) {
         const s = desktops.get(session_id);
         await s.capture({ maxMs: 8_000 }); // burst if idle-paused; freshen if live
@@ -820,7 +820,7 @@ export function registerTools({ server, client, policy, gate, config }) {
         : '';
       // Keep session_id token clean (no trailing punctuation) so callers that parse
       // `session_id=(\S+)` capture only the id.
-      return imageResult(session.encodeJpeg({ maxWidth: 1280 }), `Desktop session opened. session_id=${session.id}${calNote}`, session);
+      return imageResult(session.encodeJpeg({ maxWidth: DEFAULT_MAX_WIDTH }), `Desktop session opened. session_id=${session.id}${calNote}`, session);
     },
   });
 
@@ -831,7 +831,7 @@ export function registerTools({ server, client, policy, gate, config }) {
   // when its tiles appear, and a genuine no-op falls back to a forced refresh.
   async function afterInput(session) {
     await session.capture({ watch: true, settleMs: 300, maxMs: 8_000 });
-    return session.encodeJpeg({ maxWidth: 1280 });
+    return session.encodeJpeg({ maxWidth: DEFAULT_MAX_WIDTH });
   }
 
   define({
@@ -959,7 +959,7 @@ export function registerTools({ server, client, policy, gate, config }) {
       if (!s.isOpen) return errorResult(`Desktop ${session_id} is closed.`);
       s.setDisplay(display);
       await s.capture({ maxMs: 6_000 });
-      return imageResult(s.encodeJpeg({ maxWidth: 1280 }), `Switched to display ${display}:`, s);
+      return imageResult(s.encodeJpeg({ maxWidth: DEFAULT_MAX_WIDTH }), `Switched to display ${display}:`, s);
     },
   });
 

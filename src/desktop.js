@@ -18,6 +18,11 @@ const CMD_INPUT_LOCK = 87;   // remote input locked (our input is ignored)
 const CMD_JUMBO = 27;        // 8-byte header wrapping a frame larger than 65535 bytes
 const MAX_NOTICES = 20;
 const MONITOR_MS = 12_000;   // re-probe RTT this often; frame cost every 3rd tick
+// Default screenshot width. Downscaling cuts the model's vision-ingest cost per
+// step (~width*height/750 tokens); 960 keeps window titles, menus and dialog
+// buttons legible for verification while being ~45% cheaper than 1280. Callers
+// can pass a larger max_width (up to native) to read fine print on demand.
+export const DEFAULT_MAX_WIDTH = 960;
 
 // Image encoding we request from the agent (compression cmd byte 4):
 // 1=JPEG, 2=PNG, 3=TIFF, 4=WebP. We pin JPEG because the tile decoder below is
@@ -371,7 +376,7 @@ export class DesktopSession {
   hasFrame() { return this.#fb != null && this.#tiles > 0; }
 
   // Encode the current framebuffer as a JPEG, optionally downscaled (nearest-neighbour).
-  encodeJpeg({ quality = 70, maxWidth = 1280 } = {}) {
+  encodeJpeg({ quality = 70, maxWidth = DEFAULT_MAX_WIDTH } = {}) {
     if (!this.#fb) throw new Error('No frame captured yet');
     let { w, h, data } = { w: this.#width, h: this.#height, data: this.#fb };
     if (maxWidth && w > maxWidth) {
