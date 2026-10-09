@@ -99,6 +99,10 @@ Unlike `mesh_run_command` (one-shot, stateless), a terminal session is a live PT
 
 Output is rendered through a headless terminal emulator, so what you read is the screen a user would see. Idle sessions auto-close (`MESH_TERMINAL_IDLE_MINUTES`, default 15); concurrency is capped (`MESH_TERMINAL_MAX_SESSIONS`, default 5).
 
+### Orchestration hint
+
+The server advertises MCP `instructions` on connect suggesting a division of labour: the device-driving loop (`mesh_terminal_*`, `mesh_desktop_*`) is mechanical and latency-bound — one capture per observe→act→observe step — so when orchestrating with multiple models, delegate the driving to a fast subagent (e.g. Haiku at low reasoning) while a stronger model plans and makes decisions. The driver's role is narrow: execute the given steps, read and faithfully describe each returned screen, verify a step landed, and **escalate to the orchestrator** whenever the screen doesn't match the expected next step or anything ambiguous/risky/decision-requiring appears — it does not diagnose or improvise. Because the driver escalates rather than reasons about the unexpected, low reasoning is fine for it throughout. Judgment lives in the orchestrator; perception and execution live in the driver. Either way, read the returned output to verify every step on a live system — don't fire blind sequences.
+
 ## Remote desktop control
 
 A "computer-use" loop over MeshCentral's native KVM channel — the agent captures the console and accepts mouse/keyboard input through the server relay, so no inbound RDP port or stored OS credentials are needed. Screenshots are returned as images; coordinates are in **native screen pixels** (reported with every screenshot).
