@@ -7,10 +7,17 @@ import { DesktopManager, waitForFrame, vkFor, VK } from './desktop.js';
 import { sanitizeText, textResult, deviceResult, serverResult, errorResult, isServerError } from './safety.js';
 
 // MCP image content from a captured desktop frame.
-function imageResult(enc, header) {
+function imageResult(enc, header, session = null) {
+  const displays = session?.displays ?? enc.displays;
+  const selected = session?.selectedDisplay ?? enc.selectedDisplay;
+  let line = `${header}\n${enc.width}x${enc.height} (native ${enc.nativeWidth}x${enc.nativeHeight}). Coordinates for click/move are in NATIVE pixels.`;
+  if (displays && Object.keys(displays).length > 1) {
+    line += `\nDisplays: ${Object.entries(displays).map(([id, name]) => `${id}=${name}`).join(', ')}` +
+      `${selected != null ? ` (showing ${selected})` : ''}. Switch with mesh_desktop_set_display.`;
+  }
   return {
     content: [
-      { type: 'text', text: `${header}\n${enc.width}x${enc.height} (native ${enc.nativeWidth}x${enc.nativeHeight}). Coordinates for click/move are in NATIVE pixels.` },
+      { type: 'text', text: line },
       { type: 'image', data: enc.base64, mimeType: 'image/jpeg' },
     ],
   };
@@ -759,18 +766,19 @@ export function registerTools({ server, client, policy, gate, config }) {
     schema: {
       node_id: z.string().optional().describe('Device node ID or name (for a one-off capture; must be online)'),
       session_id: z.string().optional().describe('Open desktop session to re-capture instead'),
+      display: z.number().int().optional().describe('Display/monitor number to capture (one-off only; 65535 = all). Omit for the current one.'),
       max_width: z.number().int().positive().optional().describe('Downscale so width <= this (default 1280; use native width to disable)'),
     },
-    handler: async ({ node_id, session_id, max_width }) => {
+    handler: async ({ node_id, session_id, display, max_width }) => {
       const maxWidth = max_width ?? 1280;
       if (session_id) {
         const s = desktops.get(session_id);
-        if (!s.hasFrame()) { s.refresh(); await waitForFrame(s, { firstMs: 6_000 }); }
+        await s.capture({ firstMs: 6_000 }); // burst if idle-paused; freshen if live
         if (!s.hasFrame()) return errorResult('No frame available for that session yet.');
-        return imageResult(s.encodeJpeg({ maxWidth }), `Desktop (session ${session_id}):`);
+        return imageResult(s.encodeJpeg({ maxWidth }), `Desktop (session ${session_id}):`, s);
       }
       if (!node_id) return errorResult('Provide node_id (one-off) or session_id (open session).');
-      const enc = await desktops.screenshot(await resolveNodeId(node_id), { maxWidth });
+      const enc = await desktops.screenshot(await resolveNodeId(node_id), { maxWidth, display });
       return imageResult(enc, `Desktop of ${node_id}:`);
     },
   });
@@ -782,21 +790,32 @@ export function registerTools({ server, client, policy, gate, config }) {
       'screenshot. Use mesh_desktop_click / _type / _key / _scroll to control it, mesh_desktop_screenshot to re-capture.',
     annotations: { destructiveHint: true },
     confirmSummary: ({ node_id }) => `Open remote desktop control of ${node_id}`,
-    schema: { node_id: z.string().describe('Device node ID or name (must be online)') },
-    handler: async ({ node_id }) => {
-      const session = await desktops.open(await resolveNodeId(node_id));
+    schema: {
+      node_id: z.string().describe('Device node ID or name (must be online)'),
+      display: z.number().int().optional().describe('Display/monitor number to view (65535 = all). Omit for the primary.'),
+      stream: z.enum(['auto', 'live', 'idle']).optional().describe(
+        'Video mode. "auto" (default): pause the device stream between captures, but stay live while a human is also ' +
+        'watching this KVM. "live": always stream continuously (for simultaneous human viewing). "idle": always pause between captures.'
+      ),
+    },
+    handler: async ({ node_id, display, stream }) => {
+      const session = await desktops.open(await resolveNodeId(node_id), { streamMode: stream ?? 'auto' });
       await waitForFrame(session);
+      if (display != null) { session.setDisplay(display); await waitForFrame(session, { firstMs: 5_000 }); }
       if (!session.hasFrame()) {
         session.close('no frame');
         return errorResult('Desktop session opened but no frame was captured (no active console session, or view denied).');
       }
-      return imageResult(session.encodeJpeg({ maxWidth: 1280 }), `Desktop session opened. session_id=${session.id}`);
+      session.maybePause(); // warm session; keep streaming only if live/co-viewed
+      return imageResult(session.encodeJpeg({ maxWidth: 1280 }), `Desktop session opened. session_id=${session.id} (stream=${session.streamMode})`, session);
     },
   });
 
-  // Capture the resulting screen after an input action so the model sees the effect.
+  // Let the input land, then stream one full frame (unpause→refresh→settle→re-pause)
+  // so the model sees the effect without the device streaming while idle.
   async function afterInput(session, settle) {
-    await waitForFrame(session, { firstMs: settle, quietMs: 600, maxMs: settle + 4_000 });
+    await new Promise((r) => setTimeout(r, 150));
+    await session.capture({ firstMs: settle, quietMs: 600, maxMs: settle + 4_000 });
     return session.encodeJpeg({ maxWidth: 1280 });
   }
 
@@ -887,6 +906,40 @@ export function registerTools({ server, client, policy, gate, config }) {
       if (!s.isOpen) return errorResult(`Desktop ${session_id} is closed.`);
       s.scroll(x, y, amount);
       return imageResult(await afterInput(s, 1000), `After scroll ${amount} at (${x},${y}):`);
+    },
+  });
+
+  define({
+    name: 'mesh_desktop_set_display', tier: 'X', title: 'Select desktop monitor',
+    description: 'Switch which monitor an open desktop session shows (use the display numbers from a screenshot; 65535 = all).',
+    schema: {
+      session_id: z.string().describe('Session ID'),
+      display: z.number().int().describe('Display/monitor number (65535 = all)'),
+    },
+    handler: async ({ session_id, display }) => {
+      const s = desktops.get(session_id);
+      if (!s.isOpen) return errorResult(`Desktop ${session_id} is closed.`);
+      s.setDisplay(display);
+      await s.capture({ firstMs: 5_000 });
+      return imageResult(s.encodeJpeg({ maxWidth: 1280 }), `Switched to display ${display}:`, s);
+    },
+  });
+
+  define({
+    name: 'mesh_desktop_set_stream', tier: 'X', title: 'Set desktop stream mode',
+    description:
+      'Change a session\'s video mode. "live" keeps the device streaming continuously (for a human watching the same ' +
+      'session alongside the agent); "idle" pauses between captures to save bandwidth; "auto" stays live only while ' +
+      'another viewer is attached.',
+    schema: {
+      session_id: z.string().describe('Session ID'),
+      mode: z.enum(['auto', 'live', 'idle']).describe('Video mode'),
+    },
+    handler: async ({ session_id, mode }) => {
+      const s = desktops.get(session_id);
+      if (!s.isOpen) return errorResult(`Desktop ${session_id} is closed.`);
+      s.setStreamMode(mode);
+      return textResult(`Desktop ${session_id} stream mode set to ${s.streamMode} (viewers attached: ${s.viewers}, currently ${s.paused ? 'paused' : 'live'}).`);
     },
   });
 

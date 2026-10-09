@@ -9,6 +9,7 @@ import jpeg from 'jpeg-js';
 // The agent emits cmd 7 first; the client replies with compression + unpause.
 const CMD_TILE = 3;
 const CMD_SCREEN = 7;
+const CMD_DISPLAYS = 11;
 
 const INPUT = { KEY: 1, MOUSE: 2, CTRLALTDEL: 10, KEYUNICODE: 85 };
 const MOUSE_BTN = { none: 0x00, left: 0x02, right: 0x08, middle: 0x20 };
@@ -26,27 +27,52 @@ export class DesktopSession {
   #idleTimer;
   #idleMs;
   #onExpire;
+  #paused = false;
+  #displays = null;      // { '0': 'Display 0', '65535': 'All Displays', ... }
+  #selectedDisplay = null;
+  #streamMode = 'auto';  // 'auto' | 'live' | 'idle'
+  #viewers = 1;          // viewers attached to this device's KVM (incl. us), from metadata
+  #capturing = false;    // a capture burst is in flight; don't let metadata re-pause mid-capture
 
-  constructor({ id, ws, nodeId, idleMs, onExpire }) {
+  constructor({ id, ws, nodeId, idleMs, onExpire, streamMode = 'auto' }) {
     this.id = id;
     this.nodeId = nodeId;
     this.createdAt = Date.now();
     this.#ws = ws;
     this.#idleMs = idleMs;
     this.#onExpire = onExpire;
+    this.#streamMode = streamMode;
     ws.on('message', (d) => this.#onMessage(d));
     ws.on('close', () => { this.closed = true; clearTimeout(this.#idleTimer); this.#onExpire?.(this); });
     ws.on('error', () => {});
     this.#arm();
-    // Kick off streaming in case the agent waits for us (also sent on each screensize).
+    // Kick off streaming (the agent emits screensize first, then tiles once unpaused).
     this.#sendCompression();
     this.#sendUnpause();
+    this.requestDisplays();
   }
 
   get isOpen() { return !this.closed && this.#ws.readyState === 1; }
   get width() { return this.#width; }
   get height() { return this.#height; }
   get tilesReceived() { return this.#tiles; }
+  get paused() { return this.#paused; }
+  get displays() { return this.#displays; }
+  get selectedDisplay() { return this.#selectedDisplay; }
+  get streamMode() { return this.#streamMode; }
+  get viewers() { return this.#viewers; }
+
+  // Keep the video flowing (never idle-pause) when explicitly live, or in auto mode
+  // while another viewer (e.g. a human in the MeshCentral UI or a co-viewing bridge)
+  // is attached to this device's KVM.
+  shouldStayLive() { return this.#streamMode === 'live' || (this.#streamMode === 'auto' && this.#viewers > 1); }
+
+  setStreamMode(mode) {
+    this.#streamMode = mode;
+    if (this.shouldStayLive()) this.unpause();
+    else this.pause();
+    return this.#streamMode;
+  }
 
   #arm() {
     clearTimeout(this.#idleTimer);
@@ -56,9 +82,25 @@ export class DesktopSession {
 
   #onMessage(data) {
     const b = Buffer.isBuffer(data) ? data : Buffer.from(data);
-    if (b.length > 0 && b[0] === 0x7b) return; // JSON control frame (metadata/consent) - ignore
+    if (b.length > 0 && b[0] === 0x7b) { this.#onControl(b); return; } // JSON control frame
     this.#acc = this.#acc.length ? Buffer.concat([this.#acc, b]) : b;
     this.#parse();
+  }
+
+  // Control channel (102938): the agent announces viewer metadata when tunnels
+  // join/leave this device's KVM. Track the count so 'auto' mode can stay live
+  // while a human is also watching.
+  #onControl(buf) {
+    let msg;
+    try { msg = JSON.parse(buf.toString('utf8')); } catch { return; }
+    if (msg.ctrlChannel !== '102938') return;
+    if (msg.type === 'metadata' && msg.users && typeof msg.users === 'object') {
+      this.#viewers = Object.values(msg.users).reduce((a, n) => a + (typeof n === 'number' ? n : 1), 0) || 1;
+      // A viewer joined or left: go live if someone needs it, else idle-pause again.
+      // Skip while a capture is mid-flight so we don't cut its frames short.
+      if (this.#capturing) return;
+      if (this.shouldStayLive()) this.unpause(); else this.pause();
+    }
   }
 
   #parse() {
@@ -72,8 +114,21 @@ export class DesktopSession {
         this.#onScreen(frame.readUInt16BE(4), frame.readUInt16BE(6));
       } else if (cmd === CMD_TILE) {
         this.#onTile(frame.readUInt16BE(4), frame.readUInt16BE(6), frame.subarray(8));
+      } else if (cmd === CMD_DISPLAYS) {
+        this.#onDisplays(frame);
       }
     }
+  }
+
+  #onDisplays(frame) {
+    const dcount = frame.readUInt16BE(4);
+    const displays = {};
+    for (let i = 0; i < dcount; i++) {
+      const id = frame.readUInt16BE(6 + i * 2);
+      displays[id] = id === 65535 ? 'All Displays' : `Display ${id}`;
+    }
+    this.#selectedDisplay = dcount > 0 ? frame.readUInt16BE(6 + dcount * 2) : null;
+    this.#displays = displays;
   }
 
   #onScreen(w, h) {
@@ -138,6 +193,42 @@ export class DesktopSession {
   #sendCompression() { this.#send(Buffer.concat([Buffer.from([0, 5, 0, 10, 1, 60]), u16(1024), u16(100)])); } // JPEG q60
   #sendUnpause() { this.#send(Buffer.from([0, 8, 0, 5, 0])); }
   refresh() { this.#send(Buffer.from([0, 6, 0, 4])); }
+
+  // Pause/unpause the DEVICE-side video push. Input still works while paused, so
+  // for an observe→act→observe loop we keep the session warm but idle-paused and
+  // only stream during a capture. This stops the device encoding frames nobody is
+  // watching (the main efficiency win, especially over WAN).
+  pause() { if (!this.#paused) { this.#paused = true; this.#send(Buffer.from([0, 8, 0, 5, 1])); } }
+  unpause() { if (this.#paused) { this.#paused = false; this.#send(Buffer.from([0, 8, 0, 5, 0])); } }
+  // Pause only when nobody else needs the live stream.
+  maybePause() { if (!this.shouldStayLive()) this.pause(); }
+
+  requestDisplays() { this.#send(Buffer.from([0, 0x0b, 0, 4])); }
+
+  setDisplay(n) {
+    this.#send(Buffer.concat([Buffer.from([0, 0x0c, 0, 6]), u16(n)]));
+    this.#selectedDisplay = n;
+  }
+
+  // Produce a fresh, settled frame. When idle-paused, this is a burst
+  // (unpause → full repaint → settle → re-pause). When live (human watching),
+  // the stream is already current, so just freshen and leave it running.
+  async capture(waitOpts = {}) {
+    this.#capturing = true;
+    try {
+      if (this.#paused) {
+        this.unpause();
+        this.refresh();
+        await waitForFrame(this, waitOpts);
+        this.maybePause();
+      } else {
+        this.refresh();
+        await waitForFrame(this, { quietMs: 400, firstMs: 1_500, maxMs: 4_000, ...waitOpts });
+      }
+    } finally {
+      this.#capturing = false;
+    }
+  }
 
   // ── Input ───────────────────────────────────────────────────────────────
   #mouse(buttonByte, x, y) { this.#send(Buffer.concat([Buffer.from([0, INPUT.MOUSE, 0, 0x0a, 0x00, buttonByte]), u16(x), u16(y)])); }
@@ -212,16 +303,18 @@ export class DesktopManager {
     return [...this.#sessions.values()].map((s) => ({
       session_id: s.id, node_id: s.nodeId, open: s.isOpen,
       width: s.width, height: s.height, tiles: s.tilesReceived,
+      stream_mode: s.streamMode, streaming: !s.paused, viewers: s.viewers,
+      display: s.selectedDisplay, displays: s.displays,
       age_seconds: Math.round((Date.now() - s.createdAt) / 1000),
     }));
   }
 
-  async open(nodeId) {
+  async open(nodeId, { streamMode = 'auto' } = {}) {
     if (this.#sessions.size >= this.#max) throw new Error(`Too many open desktop sessions (max ${this.#max}). Close one with mesh_desktop_close.`);
     const ws = await this.#client.openRelay(nodeId, 2);
     const id = `desk_${crypto.randomBytes(5).toString('hex')}`;
     const session = new DesktopSession({
-      id, ws, nodeId, idleMs: this.#idleMs,
+      id, ws, nodeId, idleMs: this.#idleMs, streamMode,
       onExpire: (s) => { if (this.#sessions.get(s.id) === s) this.#sessions.delete(s.id); },
     });
     this.#sessions.set(id, session);
@@ -233,9 +326,13 @@ export class DesktopManager {
     const ws = await this.#client.openRelay(nodeId, 2);
     const session = new DesktopSession({ id: 'oneshot', ws, nodeId, idleMs: 60_000, onExpire: () => {} });
     try {
+      if (opts.display != null) session.setDisplay(opts.display);
       await waitForFrame(session, opts);
       if (!session.hasFrame()) throw new Error('No desktop frame received (no active console session to capture, or view denied).');
-      return session.encodeJpeg(opts);
+      const enc = session.encodeJpeg(opts);
+      enc.displays = session.displays;
+      enc.selectedDisplay = session.selectedDisplay;
+      return enc;
     } finally {
       session.close();
     }
