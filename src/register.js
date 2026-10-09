@@ -46,6 +46,7 @@ export function registerTools({ server, client, policy, gate, config }) {
     client,
     idleMinutes: config.desktopIdleMinutes,
     maxSessions: config.desktopMaxSessions,
+    idleFrameMs: config.desktopIdleFrameMs,
   });
 
   const registered = [];
@@ -812,6 +813,7 @@ export function registerTools({ server, client, policy, gate, config }) {
         session.close('no frame');
         return errorResult(msg);
       }
+      session.throttle(); // slow the idle stream if we're the only viewer
       return imageResult(session.encodeJpeg({ maxWidth: 1280 }), `Desktop session opened. session_id=${session.id}`, session);
     },
   });

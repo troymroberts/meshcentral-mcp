@@ -107,3 +107,28 @@ test('vkFor maps names, single chars, and marks extended keys', () => {
   assert.equal(vkFor('7').vk, 0x37);
   assert.equal(vkFor('nope').vk, undefined);
 });
+test('throttles frame rate when alone, lifts it for a co-viewer, restores after', () => {
+  const ws = new FakeWs();
+  const s = new DesktopSession({ id: 't', ws, nodeId: 'n', idleMs: 60_000, onExpire() {}, idleFrameMs: 2000 });
+  const lastRate = () => {
+    const c = ws.sent.filter((b) => b.length === 10 && b[1] === 5).pop(); // compression cmd
+    return c ? c.readUInt16BE(8) : null;
+  };
+  s.throttle();
+  assert.equal(s.frameMs, 2000);
+  assert.equal(lastRate(), 2000, 'agent asked for the slow interval');
+  ws.text(JSON.stringify({ ctrlChannel: '102938', type: 'metadata', users: { 'user//a': 1, 'user//b': 1 } }));
+  assert.equal(s.frameMs, 100, 'co-viewer present: not throttled');
+  ws.text(JSON.stringify({ ctrlChannel: '102938', type: 'metadata', users: { 'user//a': 1 } }));
+  assert.equal(s.frameMs, 2000, 'alone again: re-throttled');
+  assert.equal(lastRate(), 2000);
+  s.close();
+});
+
+test('idleFrameMs 0 disables throttling', () => {
+  const ws = new FakeWs();
+  const s = new DesktopSession({ id: 't', ws, nodeId: 'n', idleMs: 60_000, onExpire() {}, idleFrameMs: 0 });
+  s.throttle();
+  assert.equal(s.frameMs, 100);
+  s.close();
+});

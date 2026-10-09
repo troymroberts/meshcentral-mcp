@@ -106,5 +106,13 @@ export function loadConfig(env = process.env) {
     terminalMaxSessions: int(env.MESH_TERMINAL_MAX_SESSIONS, 5),
     desktopIdleMinutes: int(env.MESH_DESKTOP_IDLE_MINUTES, 10),
     desktopMaxSessions: int(env.MESH_DESKTOP_MAX_SESSIONS, 3),
+    // Frame interval (ms) requested while the agent is the only KVM viewer; 0 disables throttling.
+    desktopIdleFrameMs: nonNegInt(env.MESH_DESKTOP_IDLE_FRAME_MS, 2000),
   };
+}
+
+function nonNegInt(value, fallback) {
+  if (value === undefined || value === '') return fallback;
+  const n = parseInt(value, 10);
+  return Number.isFinite(n) && n >= 0 ? Math.min(n, 65_535) : fallback; // wire field is uint16
 }

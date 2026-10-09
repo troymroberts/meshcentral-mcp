@@ -24,6 +24,12 @@ const MAX_NOTICES = 20;
 // this stays JPEG unless the decoder is extended to match.
 const IMAGE_JPEG = 1;
 
+// Agent frame interval (compression cmd, ms between frame updates). Normal rate
+// while capturing or while a human co-views; a slow idle rate when the agent is
+// the only viewer, so the device isn't encoding a full-rate stream nobody watches.
+// (Unlike pausing, which wedged the shared KVM slave, this only changes the rate.)
+const FRAME_MS_ACTIVE = 100;
+
 const INPUT = { KEY: 1, MOUSE: 2, CTRLALTDEL: 10, KEYUNICODE: 85 };
 const MOUSE_BTN = { none: 0x00, left: 0x02, right: 0x08, middle: 0x20 };
 
@@ -47,10 +53,13 @@ export class DesktopSession {
   #inputLocked = null;   // true when the agent reports remote input is locked
   #keyState = 0;         // 1 NumLock, 2 ScrollLock, 4 CapsLock
   #displayInfo = null;   // { id: { x, y, w, h } } from cmd 82
+  #frameMs = FRAME_MS_ACTIVE; // frame interval last requested from the agent
+  #idleFrameMs;          // interval to use when the agent is the only viewer (0 = never throttle)
 
-  constructor({ id, ws, nodeId, idleMs, onExpire }) {
+  constructor({ id, ws, nodeId, idleMs, onExpire, idleFrameMs = 0 }) {
     this.id = id;
     this.nodeId = nodeId;
+    this.#idleFrameMs = idleFrameMs;
     this.createdAt = Date.now();
     this.#ws = ws;
     this.#idleMs = idleMs;
@@ -121,6 +130,13 @@ export class DesktopSession {
     if (msg.ctrlChannel !== '102938') return;
     if (msg.type === 'metadata' && msg.users && typeof msg.users === 'object') {
       this.#viewers = Object.values(msg.users).reduce((a, n) => a + (typeof n === 'number' ? n : 1), 0) || 1;
+      if (this.#viewers > 1) {
+        // A human joined: their client sets its own (full) rate when it connects;
+        // don't send ours over it. Track that the slave is no longer throttled.
+        this.#frameMs = FRAME_MS_ACTIVE;
+      } else {
+        this.throttle(); // back to agent-only: slow the stream down again
+      }
     }
   }
 
@@ -282,7 +298,21 @@ export class DesktopSession {
   }
 
   #send(buf) { if (this.isOpen) this.#ws.send(buf); this.#arm?.(); }
-  #sendCompression() { this.#send(Buffer.concat([Buffer.from([0, 5, 0, 10, IMAGE_JPEG, 60]), u16(1024), u16(100)])); } // type=JPEG, quality 60
+  #sendCompression() { this.#send(Buffer.concat([Buffer.from([0, 5, 0, 10, IMAGE_JPEG, 60]), u16(1024), u16(this.#frameMs)])); } // type=JPEG, quality 60
+
+  #setFrameRate(ms) {
+    if (ms === this.#frameMs) return;
+    this.#frameMs = ms;
+    this.#sendCompression();
+  }
+
+  get frameMs() { return this.#frameMs; }
+
+  // Slow the agent's frame rate while we're the only viewer. No-op when a human is
+  // co-viewing (they get full-rate video) or when throttling is disabled.
+  throttle() {
+    if (this.#idleFrameMs > 0 && this.#viewers <= 1) this.#setFrameRate(this.#idleFrameMs);
+  }
   // "Pause=0": tell the agent to (keep) streaming. We never send pause=1: on some
   // agents (observed on Windows Server 2022) pausing the shared KVM slave and then
   // disconnecting wedges it (screen-size but no tiles) for every later viewer until
@@ -300,9 +330,15 @@ export class DesktopSession {
 
   // Force a full repaint of the current screen and wait for it to settle, so the
   // returned frame reflects state at/after this call (not a stale earlier frame).
+  // Runs at full frame rate for the burst, then re-throttles if we're alone.
   async capture(waitOpts = {}) {
+    this.#setFrameRate(FRAME_MS_ACTIVE);
     this.refresh();
-    await waitForFrame(this, { settleMs: 500, minMs: 300, maxMs: 8_000, ...waitOpts });
+    try {
+      await waitForFrame(this, { settleMs: 500, minMs: 300, maxMs: 8_000, ...waitOpts });
+    } finally {
+      this.throttle();
+    }
   }
 
   // ── Input ───────────────────────────────────────────────────────────────
@@ -381,11 +417,13 @@ export class DesktopManager {
   #client;
   #idleMs;
   #max;
+  #idleFrameMs;
 
-  constructor({ client, idleMinutes = 10, maxSessions = 3 }) {
+  constructor({ client, idleMinutes = 10, maxSessions = 3, idleFrameMs = 2000 }) {
     this.#client = client;
     this.#idleMs = idleMinutes * 60_000;
     this.#max = maxSessions;
+    this.#idleFrameMs = idleFrameMs;
   }
 
   get(id) {
@@ -398,7 +436,7 @@ export class DesktopManager {
     return [...this.#sessions.values()].map((s) => ({
       session_id: s.id, node_id: s.nodeId, open: s.isOpen,
       width: s.width, height: s.height, tiles: s.tilesReceived,
-      viewers: s.viewers,
+      viewers: s.viewers, frame_ms: s.frameMs,
       display: s.selectedDisplay, displays: s.displays,
       age_seconds: Math.round((Date.now() - s.createdAt) / 1000),
     }));
@@ -409,7 +447,7 @@ export class DesktopManager {
     const ws = await this.#client.openRelay(nodeId, 2);
     const id = `desk_${crypto.randomBytes(5).toString('hex')}`;
     const session = new DesktopSession({
-      id, ws, nodeId, idleMs: this.#idleMs,
+      id, ws, nodeId, idleMs: this.#idleMs, idleFrameMs: this.#idleFrameMs,
       onExpire: (s) => { if (this.#sessions.get(s.id) === s) this.#sessions.delete(s.id); },
     });
     this.#sessions.set(id, session);
