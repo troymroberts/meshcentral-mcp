@@ -802,13 +802,9 @@ export function registerTools({ server, client, policy, gate, config }) {
     schema: {
       node_id: z.string().describe('Device node ID or name (must be online)'),
       display: z.number().int().optional().describe('Display/monitor number to view (65535 = all). Omit for the primary.'),
-      stream: z.enum(['auto', 'live', 'idle']).optional().describe(
-        'Video mode. "auto" (default): pause the device stream between captures, but stay live while a human is also ' +
-        'watching this KVM. "live": always stream continuously (for simultaneous human viewing). "idle": always pause between captures.'
-      ),
     },
-    handler: async ({ node_id, display, stream }) => {
-      const session = await desktops.open(await resolveNodeId(node_id), { streamMode: stream ?? 'auto' });
+    handler: async ({ node_id, display }) => {
+      const session = await desktops.open(await resolveNodeId(node_id));
       await waitForFrame(session, { requireNew: false, maxMs: 10_000 });
       if (display != null) { session.setDisplay(display); await waitForFrame(session, { maxMs: 6_000 }); }
       if (!session.hasFrame()) {
@@ -816,8 +812,7 @@ export function registerTools({ server, client, policy, gate, config }) {
         session.close('no frame');
         return errorResult(msg);
       }
-      session.maybePause(); // warm session; keep streaming only if live/co-viewed
-      return imageResult(session.encodeJpeg({ maxWidth: 1280 }), `Desktop session opened. session_id=${session.id} (stream=${session.streamMode})`, session);
+      return imageResult(session.encodeJpeg({ maxWidth: 1280 }), `Desktop session opened. session_id=${session.id}`, session);
     },
   });
 
@@ -955,24 +950,6 @@ export function registerTools({ server, client, policy, gate, config }) {
       s.setDisplay(display);
       await s.capture({ maxMs: 6_000 });
       return imageResult(s.encodeJpeg({ maxWidth: 1280 }), `Switched to display ${display}:`, s);
-    },
-  });
-
-  define({
-    name: 'mesh_desktop_set_stream', tier: 'X', title: 'Set desktop stream mode',
-    description:
-      'Change a session\'s video mode. "live" keeps the device streaming continuously (for a human watching the same ' +
-      'session alongside the agent); "idle" pauses between captures to save bandwidth; "auto" stays live only while ' +
-      'another viewer is attached.',
-    schema: {
-      session_id: z.string().describe('Session ID'),
-      mode: z.enum(['auto', 'live', 'idle']).describe('Video mode'),
-    },
-    handler: async ({ session_id, mode }) => {
-      const s = desktops.get(session_id);
-      if (!s.isOpen) return errorResult(`Desktop ${session_id} is closed.`);
-      s.setStreamMode(mode);
-      return textResult(`Desktop ${session_id} stream mode set to ${s.streamMode} (viewers attached: ${s.viewers}, currently ${s.paused ? 'paused' : 'live'}).`);
     },
   });
 

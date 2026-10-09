@@ -18,6 +18,12 @@ const CMD_INPUT_LOCK = 87;   // remote input locked (our input is ignored)
 const CMD_JUMBO = 27;        // 8-byte header wrapping a frame larger than 65535 bytes
 const MAX_NOTICES = 20;
 
+// Image encoding we request from the agent (compression cmd byte 4):
+// 1=JPEG, 2=PNG, 3=TIFF, 4=WebP. We pin JPEG because the tile decoder below is
+// jpeg-js only; the agent sends WebP/PNG/TIFF only if a client asks for it, so
+// this stays JPEG unless the decoder is extended to match.
+const IMAGE_JPEG = 1;
+
 const INPUT = { KEY: 1, MOUSE: 2, CTRLALTDEL: 10, KEYUNICODE: 85 };
 const MOUSE_BTN = { none: 0x00, left: 0x02, right: 0x08, middle: 0x20 };
 
@@ -34,25 +40,21 @@ export class DesktopSession {
   #idleTimer;
   #idleMs;
   #onExpire;
-  #paused = false;
   #displays = null;      // { '0': 'Display 0', '65535': 'All Displays', ... }
   #selectedDisplay = null;
-  #streamMode = 'auto';  // 'auto' | 'live' | 'idle'
   #viewers = 1;          // viewers attached to this device's KVM (incl. us), from metadata
-  #capturing = false;    // a capture burst is in flight; don't let metadata re-pause mid-capture
   #notices = [];         // agent alerts/messages not yet reported to the caller
   #inputLocked = null;   // true when the agent reports remote input is locked
   #keyState = 0;         // 1 NumLock, 2 ScrollLock, 4 CapsLock
   #displayInfo = null;   // { id: { x, y, w, h } } from cmd 82
 
-  constructor({ id, ws, nodeId, idleMs, onExpire, streamMode = 'auto' }) {
+  constructor({ id, ws, nodeId, idleMs, onExpire }) {
     this.id = id;
     this.nodeId = nodeId;
     this.createdAt = Date.now();
     this.#ws = ws;
     this.#idleMs = idleMs;
     this.#onExpire = onExpire;
-    this.#streamMode = streamMode;
     ws.on('message', (d, isBinary) => this.#onMessage(d, isBinary));
     ws.on('close', () => { this.closed = true; clearTimeout(this.#idleTimer); this.#onExpire?.(this); });
     ws.on('error', () => {});
@@ -78,10 +80,8 @@ export class DesktopSession {
   get width() { return this.#width; }
   get height() { return this.#height; }
   get tilesReceived() { return this.#tiles; }
-  get paused() { return this.#paused; }
   get displays() { return this.#displays; }
   get selectedDisplay() { return this.#selectedDisplay; }
-  get streamMode() { return this.#streamMode; }
   get viewers() { return this.#viewers; }
   get inputLocked() { return this.#inputLocked; }
   get capsLock() { return (this.#keyState & 4) !== 0; }
@@ -93,18 +93,6 @@ export class DesktopSession {
   #notice(kind, text) {
     this.#notices.push({ kind, text });
     if (this.#notices.length > MAX_NOTICES) this.#notices.shift();
-  }
-
-  // Keep the video flowing (never idle-pause) when explicitly live, or in auto mode
-  // while another viewer (e.g. a human in the MeshCentral UI or a co-viewing bridge)
-  // is attached to this device's KVM.
-  shouldStayLive() { return this.#streamMode === 'live' || (this.#streamMode === 'auto' && this.#viewers > 1); }
-
-  setStreamMode(mode) {
-    this.#streamMode = mode;
-    if (this.shouldStayLive()) this.unpause();
-    else this.pause();
-    return this.#streamMode;
   }
 
   #arm() {
@@ -125,18 +113,14 @@ export class DesktopSession {
   }
 
   // Control channel (102938): the agent announces viewer metadata when tunnels
-  // join/leave this device's KVM. Track the count so 'auto' mode can stay live
-  // while a human is also watching.
+  // join/leave this device's KVM. Track the count so a caller can see when a
+  // human (e.g. the MeshCentral UI) is co-viewing the same desktop.
   #onControl(buf) {
     let msg;
     try { msg = JSON.parse(buf.toString('utf8')); } catch { return; }
     if (msg.ctrlChannel !== '102938') return;
     if (msg.type === 'metadata' && msg.users && typeof msg.users === 'object') {
       this.#viewers = Object.values(msg.users).reduce((a, n) => a + (typeof n === 'number' ? n : 1), 0) || 1;
-      // A viewer joined or left: go live if someone needs it, else idle-pause again.
-      // Skip while a capture is mid-flight so we don't cut its frames short.
-      if (this.#capturing) return;
-      if (this.shouldStayLive()) this.unpause(); else this.pause();
     }
   }
 
@@ -245,6 +229,12 @@ export class DesktopSession {
   }
 
   #onTile(x, y, jpegData) {
+    // We only request JPEG (see IMAGE_JPEG); guard so a non-JPEG tile (e.g. if an
+    // agent ignored our request) surfaces a clear reason instead of a blank frame.
+    if (jpegData.length < 2 || jpegData[0] !== 0xff || jpegData[1] !== 0xd8) {
+      this.#notice('decode', 'Received a non-JPEG desktop tile; this build decodes JPEG only.');
+      return;
+    }
     let img;
     try { img = jpeg.decode(jpegData, { useTArray: true, formatAsRGBA: true }); } catch { return; }
     if (!this.#fb) { this.#width = img.width; this.#height = img.height; this.#fb = Buffer.alloc(img.width * img.height * 4, 0); }
@@ -292,23 +282,14 @@ export class DesktopSession {
   }
 
   #send(buf) { if (this.isOpen) this.#ws.send(buf); this.#arm?.(); }
-  #sendCompression() { this.#send(Buffer.concat([Buffer.from([0, 5, 0, 10, 1, 60]), u16(1024), u16(100)])); } // JPEG q60
+  #sendCompression() { this.#send(Buffer.concat([Buffer.from([0, 5, 0, 10, IMAGE_JPEG, 60]), u16(1024), u16(100)])); } // type=JPEG, quality 60
+  // "Pause=0": tell the agent to (keep) streaming. We never send pause=1: on some
+  // agents (observed on Windows Server 2022) pausing the shared KVM slave and then
+  // disconnecting wedges it (screen-size but no tiles) for every later viewer until
+  // the agent restarts. The session therefore streams continuously while open; to
+  // stop the device stream, close the session.
   #sendUnpause() { this.#send(Buffer.from([0, 8, 0, 5, 0])); }
   refresh() { this.#send(Buffer.from([0, 6, 0, 4])); }
-
-  // Pause/unpause the DEVICE-side video push. Input still works while paused, so
-  // for an observe→act→observe loop we keep the session warm but idle-paused and
-  // only stream during a capture. This stops the device encoding frames nobody is
-  // watching (the main efficiency win, especially over WAN).
-  // NOTE: Pausing the KVM stream (cmd 8 pause=1) is DISABLED. On some agents
-  // (observed on Windows Server 2022) pausing the shared remote-desktop slave and
-  // then disconnecting leaves the slave wedged (it emits screen-size but no tiles)
-  // for every subsequent viewer until the agent is restarted. The bandwidth saving
-  // is not worth wedging a shared resource, so idle sessions keep the stream live;
-  // to truly stop the device stream, close the session instead.
-  pause() { /* intentionally a no-op; see note above */ }
-  unpause() { if (this.#paused) { this.#paused = false; } this.#send(Buffer.from([0, 8, 0, 5, 0])); }
-  maybePause() { /* no-op: never pause the shared slave */ }
 
   requestDisplays() { this.#send(Buffer.from([0, 0x0b, 0, 4])); }
 
@@ -317,22 +298,11 @@ export class DesktopSession {
     this.#selectedDisplay = n;
   }
 
-  // Produce a fresh, settled frame. When idle-paused, this is a burst
-  // (unpause → full repaint → settle → re-pause). When live (human watching),
-  // the stream is already current, so just freshen and leave it running.
   // Force a full repaint of the current screen and wait for it to settle, so the
   // returned frame reflects state at/after this call (not a stale earlier frame).
   async capture(waitOpts = {}) {
-    this.#capturing = true;
-    try {
-      const wasPaused = this.#paused;
-      if (wasPaused) this.unpause();
-      this.refresh();
-      await waitForFrame(this, { settleMs: 500, minMs: 300, maxMs: 8_000, ...waitOpts });
-      if (wasPaused) this.maybePause();
-    } finally {
-      this.#capturing = false;
-    }
+    this.refresh();
+    await waitForFrame(this, { settleMs: 500, minMs: 300, maxMs: 8_000, ...waitOpts });
   }
 
   // ── Input ───────────────────────────────────────────────────────────────
@@ -428,18 +398,18 @@ export class DesktopManager {
     return [...this.#sessions.values()].map((s) => ({
       session_id: s.id, node_id: s.nodeId, open: s.isOpen,
       width: s.width, height: s.height, tiles: s.tilesReceived,
-      stream_mode: s.streamMode, streaming: !s.paused, viewers: s.viewers,
+      viewers: s.viewers,
       display: s.selectedDisplay, displays: s.displays,
       age_seconds: Math.round((Date.now() - s.createdAt) / 1000),
     }));
   }
 
-  async open(nodeId, { streamMode = 'auto' } = {}) {
+  async open(nodeId) {
     if (this.#sessions.size >= this.#max) throw new Error(`Too many open desktop sessions (max ${this.#max}). Close one with mesh_desktop_close.`);
     const ws = await this.#client.openRelay(nodeId, 2);
     const id = `desk_${crypto.randomBytes(5).toString('hex')}`;
     const session = new DesktopSession({
-      id, ws, nodeId, idleMs: this.#idleMs, streamMode,
+      id, ws, nodeId, idleMs: this.#idleMs,
       onExpire: (s) => { if (this.#sessions.get(s.id) === s) this.#sessions.delete(s.id); },
     });
     this.#sessions.set(id, session);
