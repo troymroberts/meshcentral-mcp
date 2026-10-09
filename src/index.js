@@ -54,10 +54,11 @@ try {
   process.exit(1);
 }
 
-const { registered, terminals } = registerTools({ server, client, policy, gate, config });
+const { registered, terminals, desktops } = registerTools({ server, client, policy, gate, config });
 
 function shutdown() {
   try { terminals.closeAll(); } catch {}
+  try { desktops.closeAll(); } catch {}
   try { client.disconnect(); } catch {}
   process.exit(0);
 }

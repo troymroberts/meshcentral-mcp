@@ -104,5 +104,7 @@ export function loadConfig(env = process.env) {
     maxOutputChars: int(env.MESH_MCP_MAX_OUTPUT, 100_000),
     terminalIdleMinutes: int(env.MESH_TERMINAL_IDLE_MINUTES, 15),
     terminalMaxSessions: int(env.MESH_TERMINAL_MAX_SESSIONS, 5),
+    desktopIdleMinutes: int(env.MESH_DESKTOP_IDLE_MINUTES, 10),
+    desktopMaxSessions: int(env.MESH_DESKTOP_MAX_SESSIONS, 3),
   };
 }

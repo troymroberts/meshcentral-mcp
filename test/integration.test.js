@@ -97,3 +97,18 @@ test('local file jail blocks path traversal on download', opts, async () => {
   assert.equal(r.isError, true);
   assert.match(r.text, /outside the permitted directory/);
 });
+
+// Desktop capture needs an active graphical console; gate it separately.
+const deskOpts = { skip: RUN && process.env.MESH_TEST_DESKTOP === '1' ? false : 'set MESH_TEST_DESKTOP=1 (needs a device with an active desktop)' };
+
+test('desktop screenshot returns an image with native dimensions', deskOpts, async () => {
+  const r = await client.callTool(
+    { name: 'mesh_desktop_screenshot', arguments: { node_id: NODE } },
+    undefined,
+    { timeout: 60_000 }
+  );
+  assert.equal(!!r.isError, false, r.content.map((c) => c.text).join(' '));
+  const img = r.content.find((c) => c.type === 'image');
+  assert.ok(img && img.data.length > 1000, 'expected a JPEG image payload');
+  assert.match(r.content.find((c) => c.type === 'text').text, /native \d+x\d+/);
+});

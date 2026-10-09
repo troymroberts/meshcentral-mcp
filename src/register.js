@@ -3,7 +3,18 @@ import { z } from 'zod';
 import { resolveLocalPath } from './local-path.js';
 import { FileTunnel, splitRemotePath, joinRemotePath } from './file-tunnel.js';
 import { TerminalManager, waitForOutput, SHELLS } from './terminal.js';
+import { DesktopManager, waitForFrame, vkFor, VK } from './desktop.js';
 import { sanitizeText, textResult, deviceResult, serverResult, errorResult, isServerError } from './safety.js';
+
+// MCP image content from a captured desktop frame.
+function imageResult(enc, header) {
+  return {
+    content: [
+      { type: 'text', text: `${header}\n${enc.width}x${enc.height} (native ${enc.nativeWidth}x${enc.nativeHeight}). Coordinates for click/move are in NATIVE pixels.` },
+      { type: 'image', data: enc.base64, mimeType: 'image/jpeg' },
+    ],
+  };
+}
 
 // Capability tier of each tool. Drives both profile gating and whether the tool
 // is treated as confirmable (X/WF/P/A tools can require approval).
@@ -14,6 +25,11 @@ export function registerTools({ server, client, policy, gate, config }) {
     client,
     idleMinutes: config.terminalIdleMinutes,
     maxSessions: config.terminalMaxSessions,
+  });
+  const desktops = new DesktopManager({
+    client,
+    idleMinutes: config.desktopIdleMinutes,
+    maxSessions: config.desktopMaxSessions,
   });
 
   const registered = [];
@@ -732,6 +748,164 @@ export function registerTools({ server, client, policy, gate, config }) {
     },
   });
 
+  // ── Remote desktop (KVM) ──────────────────────────────────────────────────
+  // Screenshot is RF (remote view). Opening a control session and sending input
+  // are X (remote control of the console).
+  define({
+    name: 'mesh_desktop_screenshot', tier: 'RF', title: 'Desktop screenshot',
+    description:
+      'Capture a screenshot of a device desktop as a JPEG image. Pass session_id to grab the current frame of an ' +
+      'open session, or node_id to take a one-off capture. Returns the image plus its native pixel dimensions.',
+    schema: {
+      node_id: z.string().optional().describe('Device node ID or name (for a one-off capture; must be online)'),
+      session_id: z.string().optional().describe('Open desktop session to re-capture instead'),
+      max_width: z.number().int().positive().optional().describe('Downscale so width <= this (default 1280; use native width to disable)'),
+    },
+    handler: async ({ node_id, session_id, max_width }) => {
+      const maxWidth = max_width ?? 1280;
+      if (session_id) {
+        const s = desktops.get(session_id);
+        if (!s.hasFrame()) { s.refresh(); await waitForFrame(s, { firstMs: 6_000 }); }
+        if (!s.hasFrame()) return errorResult('No frame available for that session yet.');
+        return imageResult(s.encodeJpeg({ maxWidth }), `Desktop (session ${session_id}):`);
+      }
+      if (!node_id) return errorResult('Provide node_id (one-off) or session_id (open session).');
+      const enc = await desktops.screenshot(await resolveNodeId(node_id), { maxWidth });
+      return imageResult(enc, `Desktop of ${node_id}:`);
+    },
+  });
+
+  define({
+    name: 'mesh_desktop_open', tier: 'X', title: 'Open desktop session',
+    description:
+      'Open an interactive remote-desktop (KVM) session to a device console and return a session_id plus the first ' +
+      'screenshot. Use mesh_desktop_click / _type / _key / _scroll to control it, mesh_desktop_screenshot to re-capture.',
+    annotations: { destructiveHint: true },
+    confirmSummary: ({ node_id }) => `Open remote desktop control of ${node_id}`,
+    schema: { node_id: z.string().describe('Device node ID or name (must be online)') },
+    handler: async ({ node_id }) => {
+      const session = await desktops.open(await resolveNodeId(node_id));
+      await waitForFrame(session);
+      if (!session.hasFrame()) {
+        session.close('no frame');
+        return errorResult('Desktop session opened but no frame was captured (no active console session, or view denied).');
+      }
+      return imageResult(session.encodeJpeg({ maxWidth: 1280 }), `Desktop session opened. session_id=${session.id}`);
+    },
+  });
+
+  // Capture the resulting screen after an input action so the model sees the effect.
+  async function afterInput(session, settle) {
+    await waitForFrame(session, { firstMs: settle, quietMs: 600, maxMs: settle + 4_000 });
+    return session.encodeJpeg({ maxWidth: 1280 });
+  }
+
+  define({
+    name: 'mesh_desktop_click', tier: 'X', title: 'Desktop click',
+    description: 'Click (or double-click) at native pixel coordinates in a desktop session, then return a fresh screenshot.',
+    annotations: { destructiveHint: true },
+    confirmSummary: ({ session_id, x, y, button }) => `${button || 'left'}-click at (${x},${y}) in desktop ${session_id}`,
+    schema: {
+      session_id: z.string().describe('Session ID from mesh_desktop_open'),
+      x: z.number().int().min(0).describe('X in native pixels'),
+      y: z.number().int().min(0).describe('Y in native pixels'),
+      button: z.enum(['left', 'right', 'middle']).optional().describe('Mouse button (default left)'),
+      double: z.boolean().optional().describe('Double-click'),
+    },
+    handler: async ({ session_id, x, y, button, double }) => {
+      const s = desktops.get(session_id);
+      if (!s.isOpen) return errorResult(`Desktop ${session_id} is closed.`);
+      s.click(x, y, button ?? 'left', double ?? false);
+      return imageResult(await afterInput(s, 1500), `After ${double ? 'double-' : ''}${button ?? 'left'}-click at (${x},${y}):`);
+    },
+  });
+
+  define({
+    name: 'mesh_desktop_move', tier: 'X', title: 'Desktop mouse move',
+    description: 'Move the mouse to native pixel coordinates (no click).',
+    annotations: { destructiveHint: true },
+    confirmSummary: ({ session_id, x, y }) => `Move mouse to (${x},${y}) in desktop ${session_id}`,
+    schema: {
+      session_id: z.string().describe('Session ID'),
+      x: z.number().int().min(0), y: z.number().int().min(0),
+    },
+    handler: async ({ session_id, x, y }) => {
+      const s = desktops.get(session_id);
+      s.move(x, y);
+      return textResult(`Moved to (${x},${y}).`);
+    },
+  });
+
+  define({
+    name: 'mesh_desktop_type', tier: 'X', title: 'Desktop type text',
+    description: 'Type a string into the desktop session (sent as Unicode key events), then return a screenshot.',
+    annotations: { destructiveHint: true },
+    confirmSummary: ({ session_id, text }) => `Type into desktop ${session_id}: ${text}`,
+    schema: {
+      session_id: z.string().describe('Session ID'),
+      text: z.string().describe('Text to type'),
+    },
+    handler: async ({ session_id, text }) => {
+      const s = desktops.get(session_id);
+      if (!s.isOpen) return errorResult(`Desktop ${session_id} is closed.`);
+      s.typeText(text);
+      return imageResult(await afterInput(s, 1200), `After typing ${JSON.stringify(text)}:`);
+    },
+  });
+
+  define({
+    name: 'mesh_desktop_key', tier: 'X', title: 'Desktop key press',
+    description: `Press a special key by name (then screenshot). Known: ${Object.keys(VK).join(', ')}.`,
+    annotations: { destructiveHint: true },
+    confirmSummary: ({ session_id, key }) => `Press ${key} in desktop ${session_id}`,
+    schema: {
+      session_id: z.string().describe('Session ID'),
+      key: z.string().describe('Key name (e.g. enter, tab, escape, win, f5, up)'),
+    },
+    handler: async ({ session_id, key }) => {
+      const s = desktops.get(session_id);
+      if (!s.isOpen) return errorResult(`Desktop ${session_id} is closed.`);
+      const { vk, extended } = vkFor(key);
+      if (vk == null) return errorResult(`Unknown key '${key}'. Known: ${Object.keys(VK).join(', ')}`);
+      s.keyVk(vk, extended);
+      return imageResult(await afterInput(s, 1000), `After pressing ${key}:`);
+    },
+  });
+
+  define({
+    name: 'mesh_desktop_scroll', tier: 'X', title: 'Desktop scroll',
+    description: 'Scroll the mouse wheel at native pixel coordinates (positive = up), then screenshot.',
+    annotations: { destructiveHint: true },
+    confirmSummary: ({ session_id, amount }) => `Scroll ${amount} in desktop ${session_id}`,
+    schema: {
+      session_id: z.string().describe('Session ID'),
+      x: z.number().int().min(0), y: z.number().int().min(0),
+      amount: z.number().int().describe('Wheel delta (positive = up, negative = down; e.g. 360)'),
+    },
+    handler: async ({ session_id, x, y, amount }) => {
+      const s = desktops.get(session_id);
+      if (!s.isOpen) return errorResult(`Desktop ${session_id} is closed.`);
+      s.scroll(x, y, amount);
+      return imageResult(await afterInput(s, 1000), `After scroll ${amount} at (${x},${y}):`);
+    },
+  });
+
+  define({
+    name: 'mesh_desktop_list', tier: 'R', title: 'List desktop sessions',
+    description: 'List open remote-desktop sessions.',
+    handler: async () => textResult(desktops.list()),
+  });
+
+  define({
+    name: 'mesh_desktop_close', tier: 'X', title: 'Close desktop session',
+    description: 'Close an open remote-desktop session.',
+    schema: { session_id: z.string().describe('Session ID') },
+    handler: async ({ session_id }) => {
+      desktops.get(session_id).close('closed by user');
+      return textResult(`Desktop ${session_id} closed.`);
+    },
+  });
+
   // ════════════════════════════════════════════════════════════════════════
   // WF — remote file write / destruction
   // ════════════════════════════════════════════════════════════════════════
@@ -1010,5 +1184,5 @@ export function registerTools({ server, client, policy, gate, config }) {
     handler: async ({ command }) => serverResult(await client.sendCommand({ action: 'serverconsole', value: command }, 20_000)),
   });
 
-  return { registered, terminals };
+  return { registered, terminals, desktops };
 }

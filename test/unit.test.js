@@ -11,6 +11,7 @@ import {
 } from '../src/safety.js';
 import { splitRemotePath, joinRemotePath, isWindowsPath } from '../src/file-tunnel.js';
 import { resolveLocalPath, _resetLocalFileRoot } from '../src/local-path.js';
+import { vkFor, VK } from '../src/desktop.js';
 
 test('parseEnvFile handles quotes, comments, export', () => {
   const env = parseEnvFile('export A=1\nB="two words" # c\nC=\'x\'\n# comment\nD=\n');
@@ -133,6 +134,14 @@ test('resolveLocalPath confines to the jail and blocks traversal', () => {
   assert.throws(() => resolveLocalPath('../escape.txt', { env }), /outside the permitted directory/);
   assert.throws(() => resolveLocalPath('/etc/passwd', { env }), /outside the permitted directory/);
   _resetLocalFileRoot();
+});
+
+test('vkFor maps key names to VK codes and marks extended keys', () => {
+  assert.equal(vkFor('enter').vk, VK.enter);
+  assert.equal(vkFor('ENTER').vk, VK.enter);
+  assert.equal(vkFor('up').extended, true);
+  assert.equal(vkFor('enter').extended, false);
+  assert.equal(vkFor('nope').vk, undefined);
 });
 
 test('resolveLocalPath blocks symlink escape', () => {
