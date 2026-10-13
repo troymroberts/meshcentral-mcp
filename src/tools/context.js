@@ -394,6 +394,7 @@ export function createContext({ server, client, policy, gate, config, audit = ne
   // the caller stopped waiting, and the late result stays fetchable by job ID.
   const shellQueues = new Map(); // nodeId -> tail promise
   const jobs = new Map(); // jobId -> job
+  const runningJobs = new Map(); // nodeId -> the job currently sent to that agent
   const BUSY_RE = /run commands can'?t execute, already busy/i;
   const MAX_JOBS = 200;
   const jobFinished = (job) => job.status === 'done' || job.status === 'failed';
@@ -405,20 +406,27 @@ export function createContext({ server, client, policy, gate, config, audit = ne
       id: `job_${crypto.randomBytes(4).toString('hex')}`,
       nodeId: node._id, nodeName: node.name, command, type, visible,
       status: 'queued', queuedAt: Date.now(), startedAt: null, endedAt: null, output: null, error: null,
+      abort: null, // set while running: abort(reason) fails the job and releases the queue
     };
     const lifetimeMs = config.commandMaxTimeoutSeconds * 1000;
     const prev = shellQueues.get(node._id) ?? Promise.resolve();
     job.promise = prev.then(async () => {
+      if (job.status === 'failed') return; // cancelled while queued
       job.status = 'running';
       job.startedAt = Date.now();
+      runningJobs.set(node._id, job);
+      const aborted = new Promise((_, reject) => { job.abort = (reason) => reject(new Error(reason)); });
       try {
-        job.output = cleanShellOutput(await runShellNow(node, command, type, lifetimeMs), node, type);
+        const out = await Promise.race([runShellNow(node, command, type, lifetimeMs), aborted]);
+        job.output = cleanShellOutput(out, node, type);
         job.status = 'done';
       } catch (err) {
         job.error = err.message;
         job.status = 'failed';
       } finally {
+        job.abort = null;
         job.endedAt = Date.now();
+        if (runningJobs.get(node._id) === job) runningJobs.delete(node._id);
       }
     });
     shellQueues.set(node._id, job.promise);
@@ -430,6 +438,37 @@ export function createContext({ server, client, policy, gate, config, audit = ne
     return job;
   }
 
+  // Stop tracking a job. A running one is failed with `reason` and the device's
+  // queue moves on (the command may still be running on the device); a queued
+  // one is dropped before it is sent.
+  function cancelJob(job, reason) {
+    if (jobFinished(job)) return false;
+    if (job.status === 'running' && job.abort) {
+      job.abort(reason);
+    } else {
+      job.status = 'failed';
+      job.error = reason;
+      job.endedAt = Date.now();
+    }
+    return true;
+  }
+
+  // An agent restart kills whatever it was running, and its reply never comes.
+  // MeshCentral announces agent connect/disconnect as "nodeconnect" events: fail
+  // the running job on that device when its agent goes away, or when it is seen
+  // (re)connected after the job started.
+  client.on('event', (m) => {
+    const e = m?.event;
+    if (e?.action !== 'nodeconnect' || !e.nodeid) return;
+    const job = runningJobs.get(e.nodeid);
+    if (!job) return;
+    if (!((e.conn ?? 0) & 1)) {
+      cancelJob(job, `The Mesh Agent on ${job.nodeName} disconnected while this command was running; its result is lost.`);
+    } else if (e.ct && e.ct > job.startedAt) {
+      cancelJob(job, `The Mesh Agent on ${job.nodeName} restarted/reconnected while this command was running; its result is lost.`);
+    }
+  });
+
   // Wait up to ms for a job to finish (no-op if it already has).
   async function waitForJob(job, ms) {
     if (jobFinished(job) || ms <= 0) return;
@@ -438,10 +477,16 @@ export function createContext({ server, client, policy, gate, config, audit = ne
     clearTimeout(timer);
   }
 
-  const stillRunningMessage = (job, waitedMs) =>
-    `${job.status === 'queued' ? 'Still queued behind an earlier command' : 'Still running'} on ${job.nodeName} ` +
-    `after ${Math.round(waitedMs / 1000)}s. Tracked as job ${job.id}: fetch the result later with mesh_job_status ` +
-    `(job_id "${job.id}"). Further commands to this device queue behind it; a terminal (mesh_terminal_*) is not blocked.`;
+  const stillRunningMessage = (job, waitedMs) => {
+    const ahead = job.status === 'queued' ? runningJobs.get(job.nodeId) : null;
+    const behind = ahead
+      ? `Still queued on ${job.nodeName} behind job ${ahead.id} (running ${Math.round((Date.now() - ahead.startedAt) / 1000)}s: ` +
+        `${ahead.command.length > 80 ? ahead.command.slice(0, 80) + '…' : ahead.command}). If that job is stuck (e.g. the ` +
+        `agent was restarted), release it with mesh_job_cancel.`
+      : `${job.status === 'queued' ? 'Still queued behind an earlier command' : 'Still running'} on ${job.nodeName}.`;
+    return `${behind} Waited ${Math.round(waitedMs / 1000)}s. Tracked as job ${job.id}: fetch the result later with ` +
+      `mesh_job_status (job_id "${job.id}"). A terminal (mesh_terminal_*) is not blocked by the queue.`;
+  };
 
   // Run and wait up to timeoutMs. On timeout the job keeps running and the error names it.
   async function runShell(node, command, type = 0, timeoutMs = 30_000) {
@@ -549,7 +594,7 @@ export function createContext({ server, client, policy, gate, config, audit = ne
     meshId, allNodes, allMeshes, humanizeIds, getNode, requireNode, resolveNodeId, resolveNodeIds, isWindowsNode,
     withStatus, lastConnect, lastConnects, deviceEvents, ago,
     RUN_TYPE_LABEL, readOnlyFor, withProgress, READONLY_AGENT_CONSOLE,
-    runShell, startShellJob, waitForJob, jobs, jobFinished, stillRunningMessage,
+    runShell, startShellJob, waitForJob, cancelJob, jobs, runningJobs, jobFinished, stillRunningMessage,
     runConsole, processList, withFileTunnel, imageResult,
   };
 }

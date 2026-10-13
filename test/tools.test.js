@@ -84,7 +84,10 @@ function setup({ confirmMode = 'off', deviceEvents = 'changes', profile = 'opera
     const r = await server.tools[name].cb(args, {});
     return { text: r.content[0].text, isError: Boolean(r.isError) };
   };
-  return { client, server, audit, call, cleanup: () => { terminals.closeAll(); desktops.closeAll(); } };
+  // The server's wait timers are unref'd (stdio keeps the real process alive);
+  // keep the test's event loop alive while fakes never answer.
+  const keepAlive = setInterval(() => {}, 1000);
+  return { client, server, audit, call, cleanup: () => { clearInterval(keepAlive); terminals.closeAll(); desktops.closeAll(); } };
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -303,4 +306,62 @@ test('approval prompts offer a per-device choice when one device is involved', a
   assert.ok(schema.properties.decision.enum.includes('device'));
   assert.match(schema.properties.decision.enumNames.join('|'), /on web01 for this session/);
   assert.equal(gate.isGranted('mesh_terminal_input', 'X', ['node//lin1']), true);
+});
+
+// ── stuck jobs: agent restarts and manual cancel ────────────────────────
+
+test('an agent disconnect fails the running job and releases the queue', async () => {
+  const { client, call, cleanup } = setup();
+  let n = 0;
+  client.run = (cmd) => (++n === 1 ? new Promise(() => {}) : Promise.resolve(`second: ${cmd.cmds}`));
+  const first = await call('mesh_run_command', { node_id: 'web01', command: 'hostname', background: true });
+  const jobId = first.text.match(/job_[0-9a-f]{8}/)[0];
+  const second = call('mesh_run_command', { node_id: 'web01', command: 'uptime', timeout_seconds: 5 });
+  await sleep(50);
+  client.emit({ action: 'event', event: { action: 'nodeconnect', nodeid: 'node//lin1', conn: 0 } });
+  assert.match((await second).text, /second: uptime/);
+  const s = await call('mesh_job_status', { job_id: jobId });
+  assert.equal(s.isError, true);
+  assert.match(s.text, /disconnected while this command was running/);
+  cleanup();
+});
+
+test('an agent reconnect after the job started fails it; an older connect time does not', async () => {
+  const { client, call, cleanup } = setup();
+  client.run = () => new Promise(() => {});
+  const r = await call('mesh_run_command', { node_id: 'web01', command: 'hostname', background: true });
+  const jobId = r.text.match(/job_[0-9a-f]{8}/)[0];
+  await sleep(20);
+  client.emit({ action: 'event', event: { action: 'nodeconnect', nodeid: 'node//lin1', conn: 1, ct: Date.now() - 60_000 } });
+  assert.match((await call('mesh_job_status', { job_id: jobId })).text, /"status": "running"/);
+  client.emit({ action: 'event', event: { action: 'nodeconnect', nodeid: 'node//lin1', conn: 1, ct: Date.now() } });
+  assert.match((await call('mesh_job_status', { job_id: jobId })).text, /restarted\/reconnected/);
+  cleanup();
+});
+
+test('mesh_job_cancel releases a stuck job; "still queued" names the blocking job', async () => {
+  const { client, call, cleanup } = setup();
+  let n = 0;
+  client.run = () => (++n === 1 ? new Promise(() => {}) : Promise.resolve('after cancel'));
+  const stuck = await call('mesh_run_command', { node_id: 'web01', command: 'hostname', background: true });
+  const stuckId = stuck.text.match(/job_[0-9a-f]{8}/)[0];
+  const waiting = await call('mesh_run_command', { node_id: 'web01', command: 'uptime', timeout_seconds: 1 });
+  assert.match(waiting.text, new RegExp(`queued on web01 behind job ${stuckId}.*mesh_job_cancel`, 's'));
+  const queuedId = waiting.text.match(/Tracked as job (job_[0-9a-f]{8})/)[1];
+  assert.match((await call('mesh_job_cancel', { job_id: stuckId })).text, /Cancelled job_/);
+  assert.match((await call('mesh_job_status', { job_id: queuedId, wait_seconds: 2 })).text, /after cancel/);
+  cleanup();
+});
+
+test('mesh_job_cancel by device drops queued jobs before they are sent', async () => {
+  const { client, call, cleanup } = setup();
+  client.run = () => new Promise(() => {});
+  await call('mesh_run_command', { node_id: 'web01', command: 'hostname', background: true });
+  await call('mesh_run_command', { node_id: 'web01', command: 'uptime', background: true });
+  await sleep(20);
+  const r = await call('mesh_job_cancel', { node_id: 'web01' });
+  assert.match(r.text, /Cancelled job_[0-9a-f]{8} on web01, job_[0-9a-f]{8} on web01/);
+  await sleep(20);
+  assert.equal(runs(client).length, 1); // the queued "uptime" was never sent
+  cleanup();
 });

@@ -8,7 +8,7 @@ import { textResult, deviceResult, errorResult, trimLines } from '../safety.js';
 export default function register(ctx) {
   const {
     define, config, terminals, getNode, requireNode, isWindowsNode, RUN_TYPE_LABEL, readOnlyFor, withProgress,
-    READONLY_AGENT_CONSOLE, startShellJob, waitForJob, jobs, jobFinished, stillRunningMessage, runConsole,
+    READONLY_AGENT_CONSOLE, startShellJob, waitForJob, cancelJob, jobs, runningJobs, jobFinished, stillRunningMessage, runConsole,
   } = ctx;
 
   const lineOptions = {
@@ -125,9 +125,47 @@ export default function register(ctx) {
       if (!job) return errorResult(`No job '${job_id}' (jobs last for this server session; the 200 most recent are kept).`);
       if (wait_seconds) await withProgress(extra, `Waiting for ${job.id}`, () => waitForJob(job, wait_seconds * 1000));
       if (job.status === 'failed') return errorResult(`${job.id} on ${job.nodeName} failed: ${job.error}`);
-      if (!jobFinished(job)) return textResult({ ...brief(job), note: 'Not finished yet; call again (optionally with wait_seconds).' });
+      if (!jobFinished(job)) {
+        const ahead = job.status === 'queued' ? runningJobs.get(job.nodeId) : null;
+        return textResult({
+          ...brief(job),
+          ...(ahead ? { queued_behind: brief(ahead) } : {}),
+          note: 'Not finished yet; call again (optionally with wait_seconds). If it is stuck, mesh_job_cancel releases it.',
+        });
+      }
       return deviceResult(trimmed(job.output || '(no output)', { head_lines, tail_lines }),
         `${job.id} ${promptFor(job.type)} ${job.nodeName}> ${job.command} (done in ${Math.round((job.endedAt - job.startedAt) / 1000)}s)`);
+    },
+  });
+
+  define({
+    name: 'mesh_job_cancel', tier: 'W', title: 'Cancel command job',
+    description:
+      'Stop tracking a mesh_run_command job and release the device\'s command queue. Use it when a job is stuck - ' +
+      'typically after the Mesh Agent was restarted and the command died with it (normally detected automatically). ' +
+      'A queued job is dropped before it is sent. A running one is only abandoned here: if the command is really ' +
+      'still running on the device, the agent will refuse new commands until it ends.',
+    schema: {
+      job_id: z.string().optional().describe('Job to cancel'),
+      node_id: z.string().optional().describe('Or: cancel the running and queued jobs for this device'),
+    },
+    change: () => false,
+    describe: async ({ job_id, node_id }) => `Cancel ${job_id ? `job ${job_id}` : `jobs on ${node_id}`}`,
+    handler: async ({ job_id, node_id }) => {
+      let targets;
+      if (job_id) {
+        const job = jobs.get(job_id);
+        if (!job) return errorResult(`No job '${job_id}'.`);
+        targets = [job];
+      } else if (node_id) {
+        const node = await requireNode(node_id);
+        targets = [...jobs.values()].filter((j) => j.nodeId === node._id && !jobFinished(j));
+      } else {
+        return errorResult('Provide job_id or node_id.');
+      }
+      const cancelled = targets.filter((j) => cancelJob(j, 'Cancelled by request (mesh_job_cancel).'));
+      if (!cancelled.length) return textResult('Nothing to cancel (job already finished).');
+      return textResult(`Cancelled ${cancelled.map((j) => `${j.id} on ${j.nodeName}`).join(', ')}. The device's queue is released.`);
     },
   });
 

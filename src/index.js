@@ -79,7 +79,8 @@ Running commands - one at a time per device:
 - A command that outlives timeout_seconds keeps running as a background job; its
   job_id is returned - fetch the result with mesh_job_status. Pass
   background=true for slow jobs (dcdiag, sfc, big log queries). Use tail_lines to
-  keep large output short.
+  keep large output short. If a job is stuck (e.g. the agent was restarted and
+  it was not detected), mesh_job_cancel releases the device's queue.
 - Prefer several short, single-purpose read-only commands over one big script:
   read-only lines are auto-approved, a combined script asks the user, and a slow
   script blocks the device for other commands.
