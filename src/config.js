@@ -101,6 +101,15 @@ export function loadConfig(env = process.env) {
     disableTools: list(env.MESH_MCP_DISABLE_TOOLS),
     confirmTiers: env.MESH_MCP_CONFIRM_TIERS === undefined ? null : list(env.MESH_MCP_CONFIRM_TIERS.toUpperCase()),
     confirmMode: (env.MESH_MCP_CONFIRM_MODE || 'auto').toLowerCase(),
+    // Run commands the read-only classifier recognises without a prompt.
+    autoApproveReadOnly: bool(env.MESH_MCP_AUTO_APPROVE_READONLY, true),
+    // Offer "approve for this session" choices in approval prompts.
+    sessionApproval: bool(env.MESH_MCP_SESSION_APPROVAL, true),
+    // How long an approval prompt waits for the human.
+    approvalTimeoutMs: int(env.MESH_MCP_APPROVAL_TIMEOUT_MINUTES, 30) * 60_000,
+    // Default / maximum wait for mesh_run_command output.
+    commandTimeoutSeconds: int(env.MESH_COMMAND_TIMEOUT_SECONDS, 300),
+    commandMaxTimeoutSeconds: int(env.MESH_COMMAND_MAX_TIMEOUT_SECONDS, 3600),
     maxOutputChars: int(env.MESH_MCP_MAX_OUTPUT, 100_000),
     terminalIdleMinutes: int(env.MESH_TERMINAL_IDLE_MINUTES, 15),
     terminalMaxSessions: int(env.MESH_TERMINAL_MAX_SESSIONS, 5),
@@ -109,6 +118,11 @@ export function loadConfig(env = process.env) {
     // Frame interval (ms) requested while the agent is the only KVM viewer; 0 disables throttling.
     desktopIdleFrameMs: nonNegInt(env.MESH_DESKTOP_IDLE_FRAME_MS, 2000),
   };
+}
+
+function bool(value, fallback) {
+  if (value === undefined || value === '') return fallback;
+  return !/^(false|0|no|off)$/i.test(value.trim());
 }
 
 function nonNegInt(value, fallback) {

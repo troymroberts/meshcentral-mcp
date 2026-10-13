@@ -104,7 +104,7 @@ test('ConfirmationGate token mode: issue, bind to args, single-use, expiry', () 
   assert.match(gate.redeemToken('mesh_file_delete', { path: '/y', names: ['a'], confirm_token: t2 }).reason, /does not match/);
   // expiry
   const t3 = gate.issueToken('mesh_file_delete', { path: '/x' }, 1000);
-  assert.match(gate.redeemToken('mesh_file_delete', { path: '/x', confirm_token: t3 }, 1000 + 200_000).reason, /expired/);
+  assert.match(gate.redeemToken('mesh_file_delete', { path: '/x', confirm_token: t3 }, 1000 + 700_000).reason, /expired/);
 });
 
 test('ConfirmationGate.check issues then accepts a matching token', async () => {

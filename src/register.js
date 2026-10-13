@@ -4,6 +4,7 @@ import { resolveLocalPath } from './local-path.js';
 import { FileTunnel, splitRemotePath, joinRemotePath } from './file-tunnel.js';
 import { TerminalManager, waitForOutput, SHELLS } from './terminal.js';
 import { DesktopManager, waitForFrame, vkFor, VK, noFrameMessage, DEFAULT_MAX_WIDTH } from './desktop.js';
+import { isReadOnlyCommand } from './readonly.js';
 import { sanitizeText, textResult, deviceResult, serverResult, errorResult, isServerError, UNTRUSTED_NOTE } from './safety.js';
 
 // MCP image content from a captured desktop frame.
@@ -52,7 +53,9 @@ export function registerTools({ server, client, policy, gate, config }) {
   const registered = [];
 
   // define() applies policy gating, confirmation, and uniform error handling.
-  function define({ name, tier, title, description, schema = {}, annotations = {}, confirmSummary = null, handler }) {
+  // autoApprove(args) may return true for calls that are plainly read-only; they
+  // skip confirmation when MESH_MCP_AUTO_APPROVE_READONLY is on.
+  function define({ name, tier, title, description, schema = {}, annotations = {}, confirmSummary = null, autoApprove = null, handler }) {
     if (!policy.allows(name, tier)) return;
     const confirmable = confirmSummary && CONFIRMABLE.has(tier);
     const inputSchema = { ...schema };
@@ -75,13 +78,16 @@ export function registerTools({ server, client, policy, gate, config }) {
           ...annotations,
         },
       },
-      async (args) => {
+      async (args, extra) => {
         try {
           if (confirmable && policy.needsConfirm(tier)) {
-            const gateResult = await gate.check(name, confirmSummary(args), args);
-            if (gateResult) return gateResult;
+            const readOnly = policy.autoApproveReadOnly && autoApprove && (await autoApprove(args).catch(() => false));
+            if (!readOnly) {
+              const gateResult = await gate.check(name, await confirmSummary(args), args, tier);
+              if (gateResult) return gateResult;
+            }
           }
-          return await handler(args);
+          return await handler(args, extra);
         } catch (err) {
           return errorResult(err.message);
         }
@@ -130,20 +136,113 @@ export function registerTools({ server, client, policy, gate, config }) {
     return /win/i.test(node?.osdesc || '');
   };
 
+  // Decode MeshCentral's connection/power bitfields so "is it online?" is answerable
+  // from the tier-R inventory tools without running anything on the device.
+  const CONN_BITS = [[1, 'agent'], [2, 'intel-amt-cira'], [4, 'intel-amt'], [8, 'relay'], [16, 'mqtt']];
+  const POWER_STATES = ['unknown', 'on', 'sleep', 'sleep', 'sleep', 'hibernate', 'off', 'present'];
+  const withStatus = (node) => {
+    const conn = node?.conn ?? 0;
+    const connection = CONN_BITS.filter(([bit]) => conn & bit).map(([, label]) => label);
+    return {
+      online: Boolean(conn & 1),
+      connection: connection.length ? connection : ['offline'],
+      ...(node?.pwr != null ? { power: POWER_STATES[node.pwr] ?? `state ${node.pwr}` } : {}),
+      ...node,
+    };
+  };
+
+  // Shell dialect the read-only classifier should apply to a command for a node.
+  // type 0 (auto) on Windows may run under either CMD or PowerShell, so it must
+  // satisfy both.
+  const RUN_TYPE_LABEL = { 0: 'auto', 1: 'CMD', 2: 'PowerShell', 3: 'shell' };
+  function readOnlyFor(node, command, type) {
+    if (type === 1) return isReadOnlyCommand(command, 'cmd');
+    if (type === 2) return isReadOnlyCommand(command, 'powershell');
+    if (type === 3) return isReadOnlyCommand(command, 'posix');
+    if (isWindowsNode(node)) return isReadOnlyCommand(command, 'cmd') && isReadOnlyCommand(command, 'powershell');
+    return isReadOnlyCommand(command, 'posix');
+  }
+
+  // Keep long-running calls visibly alive: clients that track MCP progress (and
+  // may reset their own request timeout on it) get a heartbeat while we wait.
+  async function withProgress(extra, label, fn, everyMs = 10_000) {
+    const token = extra?._meta?.progressToken;
+    if (token == null || !extra?.sendNotification) return fn();
+    const started = Date.now();
+    const timer = setInterval(() => {
+      const secs = Math.round((Date.now() - started) / 1000);
+      extra.sendNotification({
+        method: 'notifications/progress',
+        params: { progressToken: token, progress: secs, message: `${label} (${secs}s elapsed)` },
+      }).catch(() => {});
+    }, everyMs);
+    try { return await fn(); } finally { clearInterval(timer); }
+  }
+
+  // Read-only MeshAgent console commands (exact command word; arguments allowed
+  // only where noted).
+  const READONLY_AGENT_CONSOLE = new Set([
+    'help', 'info', 'coreinfo', 'sysinfo', 'netinfo', 'osinfo', 'cpuinfo', 'versions', 'args', 'uptime',
+    'location', 'timerinfo', 'wslist', 'agentsize', 'vm', 'apf', 'privacybar', 'kvmmode', 'wpfhwacceleration',
+  ]);
+
   // Run a shell command and return the agent's captured output. type: 1 CMD, 2 PS, 3 *nix, 0 auto.
   // On success the agent replies {action:'msg', type:'runcommands', result:<output>}; on failure the
   // server replies {action:'runcommands', result:<status>}, where result is a status, not output.
+  // The agent runs one runcommands at a time per device. A second one sent while
+  // it is busy is refused with a console message ("already busy") and never gets
+  // a reply, so calls are queued per node and the refusal is surfaced at once.
+  const shellQueues = new Map(); // nodeId -> tail promise
+  const BUSY_RE = /run commands can'?t execute, already busy/i;
+
   async function runShell(node, command, type = 0, timeoutMs = 30_000) {
-    const res = await client.sendCommand(
-      { action: 'runcommands', nodeids: [node._id], cmds: command, type, reply: true },
-      timeoutMs
-    );
+    const prev = shellQueues.get(node._id) ?? Promise.resolve();
+    const run = prev.catch(() => {}).then(() => runShellNow(node, command, type, timeoutMs));
+    const tail = run.catch(() => {});
+    shellQueues.set(node._id, tail);
+    tail.then(() => { if (shellQueues.get(node._id) === tail) shellQueues.delete(node._id); });
+    return run;
+  }
+
+  async function runShellNow(node, command, type, timeoutMs) {
+    let offBusy = () => {};
+    const busy = new Promise((_, reject) => {
+      offBusy = client.on('msg', (m) => {
+        if (m.type === 'console' && m.nodeid === node._id && BUSY_RE.test(String(m.value ?? ''))) {
+          reject(new Error(
+            `${node.name}'s agent is still running an earlier command (it may be one that timed out here and is still ` +
+            'executing on the device), so it refused this one. Use a persistent terminal (mesh_terminal_open + ' +
+            'mesh_terminal_input) instead - it is not blocked by this - or wait for the earlier command to finish; ' +
+            'restarting the Mesh Agent service clears a stuck command.'
+          ));
+        }
+      });
+    });
+    let res;
+    try {
+      res = await Promise.race([
+        client.sendCommand({ action: 'runcommands', nodeids: [node._id], cmds: command, type, reply: true }, timeoutMs),
+        busy,
+      ]);
+    } catch (err) {
+      if (/did not answer/.test(err.message)) {
+        throw new Error(
+          `No output from ${node.name} within ${Math.round(timeoutMs / 1000)}s. The command may still be running on the device ` +
+          '(it is not cancelled, and the agent refuses further commands until it ends). Retry with a larger timeout_seconds, ' +
+          'narrow the query (e.g. -MaxEvents / --since), or use an interactive terminal (mesh_terminal_*) for long-running work.'
+        );
+      }
+      throw err;
+    } finally {
+      offBusy();
+    }
     if (res.action === 'runcommands' && res.result && res.result !== 'OK') throw new Error(`MeshCentral: ${res.result}`);
     return typeof res.result === 'string' ? res.result : '';
   }
 
+
   // Agent console command (type 4). Output arrives as pushed msg/console frames, not a reply.
-  async function runConsole(node, command, { idleMs = 1200, maxMs = 20_000 } = {}) {
+  async function runConsole(node, command, { idleMs = 1500, maxMs = 45_000 } = {}) {
     const msgs = await client.collectMessages(
       (m) => m.action === 'msg' && m.type === 'console' && m.nodeid === node._id,
       async () => {
@@ -153,7 +252,7 @@ export function registerTools({ server, client, policy, gate, config }) {
         );
         if (isServerError(res)) throw new Error(`MeshCentral: ${res.result}`);
       },
-      { idleMs, maxMs, firstMs: 10_000 }
+      { idleMs, maxMs, firstMs: 20_000 }
     );
     return msgs.map((m) => m.value).join('\n');
   }
@@ -189,23 +288,31 @@ export function registerTools({ server, client, policy, gate, config }) {
 
   define({
     name: 'mesh_list_devices', tier: 'R', title: 'List devices',
-    description: 'List devices (nodes), optionally filtered by device group name or ID.',
+    description: 'List devices (nodes) with online/connection status, optionally filtered by device group name or ID.',
     schema: { group_id: z.string().optional().describe('Device group ID or name to filter by') },
     handler: async ({ group_id }) => {
       const cmd = { action: 'nodes' };
       if (group_id) cmd[group_id.includes('/') ? 'meshid' : 'meshname'] = group_id;
-      return serverResult(await client.sendCommand(cmd, 20_000));
+      const res = await client.sendCommand(cmd, 30_000);
+      if (!isServerError(res) && res?.nodes && typeof res.nodes === 'object') {
+        for (const [mesh, nodes] of Object.entries(res.nodes)) {
+          if (Array.isArray(nodes)) res.nodes[mesh] = nodes.map(withStatus);
+        }
+      }
+      return serverResult(res);
     },
   });
 
   define({
     name: 'mesh_get_device', tier: 'R', title: 'Get device',
-    description: 'Get details for one device by node ID or name.',
+    description:
+      'Get details for one device by node ID or name, including whether its agent is online ("online", "connection", ' +
+      '"power"). Use this, not a command, to check if a device or agent is up.',
     schema: { node_id: z.string().describe('Device node ID or name') },
     handler: async ({ node_id }) => {
       const node = await getNode(node_id);
       if (!node) return errorResult(`No device matching '${node_id}'`);
-      return textResult(node);
+      return textResult(withStatus(node));
     },
   });
 
@@ -354,7 +461,7 @@ export function registerTools({ server, client, policy, gate, config }) {
           "HKLM:\\Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\* " +
           "| Where-Object DisplayName | Select-Object DisplayName,DisplayVersion | Sort-Object DisplayName | Format-Table -AutoSize | Out-String"
         : "(command -v dpkg-query >/dev/null 2>&1 && dpkg-query -W -f='${Package} ${Version}\\n') || (command -v rpm >/dev/null 2>&1 && rpm -qa) || echo 'No supported package manager found'";
-      const out = await runShell(node, cmd, win ? 2 : 3, 40_000);
+      const out = await runShell(node, cmd, win ? 2 : 3, 180_000);
       return deviceResult(out, `Installed software on ${node.name}:`);
     },
   });
@@ -432,9 +539,13 @@ export function registerTools({ server, client, policy, gate, config }) {
       node_id: z.string().describe('Device node ID or name (must be online)'),
       path: z.string().describe('Directory to search in'),
       filter: z.string().describe('Filename filter (e.g. "*.log")'),
+      timeout_seconds: z.number().int().positive().max(1800).optional().describe('Max seconds to search (default 120)'),
     },
-    handler: async ({ node_id, path: dirPath, filter }) =>
-      deviceResult(await withFileTunnel(node_id, (t) => t.find(dirPath, filter)), `Search results in ${dirPath} for ${filter}:`),
+    handler: async ({ node_id, path: dirPath, filter, timeout_seconds }) => {
+      const { results, complete } = await withFileTunnel(node_id, (t) => t.find(dirPath, filter, (timeout_seconds ?? 120) * 1000));
+      const note = complete ? '' : ` (INCOMPLETE: search still running after ${timeout_seconds ?? 120}s; narrow the path or raise timeout_seconds)`;
+      return deviceResult(results, `Search results in ${dirPath} for ${filter}: ${results.length} found${note}`);
+    },
   });
 
   // ════════════════════════════════════════════════════════════════════════
@@ -645,19 +756,37 @@ export function registerTools({ server, client, policy, gate, config }) {
 
   define({
     name: 'mesh_run_command', tier: 'X', title: 'Run command',
-    description: 'Run a shell command on a device and capture its output. type: 0 auto, 1 CMD, 2 PowerShell, 3 Linux/macOS.',
+    description:
+      'Run a shell command on a device and capture its output. type: 0 auto, 1 CMD, 2 PowerShell, 3 Linux/macOS. ' +
+      'Plainly read-only commands (a single command or pipeline of Get-*/Select/Where/Format cmdlets, ipconfig, ' +
+      'systeminfo, cat/grep/tail/journalctl, systemctl status, ...) run without an approval prompt; chained (;, &&), ' +
+      'redirected, or state-changing commands ask the user. The agent runs one command at a time per device ' +
+      '(calls to the same device are queued); for several commands on one device use a persistent ' +
+      'mesh_terminal_open session instead. ' +
+      `Waits up to timeout_seconds (default ${config.commandTimeoutSeconds}) for the command to finish.`,
     annotations: { destructiveHint: true },
-    confirmSummary: ({ node_id, command, type }) => `Run on ${node_id} (type ${type ?? 0}):\n${command}`,
+    confirmSummary: async ({ node_id, command, type }) => {
+      const node = await getNode(node_id).catch(() => null);
+      return `Run on ${node?.name ?? node_id} [${RUN_TYPE_LABEL[type ?? 0]}]: ${command}`;
+    },
+    autoApprove: async ({ node_id, command, type }) => {
+      const node = await getNode(node_id);
+      return Boolean(node) && readOnlyFor(node, command, type ?? 0);
+    },
     schema: {
       node_id: z.string().describe('Device node ID or name (must be online)'),
       command: z.string().describe('Command to execute'),
       type: z.number().int().min(0).max(3).optional().describe('0 auto, 1 CMD, 2 PowerShell, 3 Linux/macOS'),
+      timeout_seconds: z.number().int().positive().max(config.commandMaxTimeoutSeconds).optional()
+        .describe(`Max seconds to wait for output (default ${config.commandTimeoutSeconds}, max ${config.commandMaxTimeoutSeconds}). Raise for slow log queries.`),
     },
-    handler: async ({ node_id, command, type }) => {
+    handler: async ({ node_id, command, type, timeout_seconds }, extra) => {
       const node = await getNode(node_id);
       if (!node) return errorResult(`No device matching '${node_id}'`);
-      const out = await runShell(node, command, type ?? 0, 60_000);
-      return deviceResult(out || '(no output)', `Output from ${node.name}:`);
+      const timeoutMs = (timeout_seconds ?? config.commandTimeoutSeconds) * 1000;
+      const out = await withProgress(extra, `Running on ${node.name}`, () => runShell(node, command, type ?? 0, timeoutMs));
+      const prompt = type === 2 ? 'PS' : type === 1 ? 'CMD' : '$';
+      return deviceResult(out || '(no output)', `${prompt} ${node.name}> ${command}`);
     },
   });
 
@@ -665,7 +794,8 @@ export function registerTools({ server, client, policy, gate, config }) {
     name: 'mesh_agent_console', tier: 'X', title: 'Agent console',
     description: 'Run a MeshAgent console command and capture its output (e.g. "help", "coreinfo", "netinfo", "service").',
     annotations: { destructiveHint: true },
-    confirmSummary: ({ node_id, command }) => `Agent console on ${node_id}:\n${command}`,
+    confirmSummary: ({ node_id, command }) => `Agent console on ${node_id}: ${command}`,
+    autoApprove: async ({ command }) => READONLY_AGENT_CONSOLE.has(command.trim().toLowerCase()),
     schema: {
       node_id: z.string().describe('Device node ID or name (must be online)'),
       command: z.string().describe('Agent console command'),
@@ -674,7 +804,7 @@ export function registerTools({ server, client, policy, gate, config }) {
       const node = await getNode(node_id);
       if (!node) return errorResult(`No device matching '${node_id}'`);
       const out = await runConsole(node, command);
-      return deviceResult(out || '(no response from agent)', `Agent console on ${node.name}:`);
+      return deviceResult(out || '(no response from agent)', `agent ${node.name}> ${command}`);
     },
   });
 
@@ -704,14 +834,32 @@ export function registerTools({ server, client, policy, gate, config }) {
     name: 'mesh_terminal_input', tier: 'X', title: 'Terminal input',
     description:
       'Send input to an open terminal session and return the new output. By default a carriage return is appended ' +
-      '(submit=true), so `input` is run as a command line. Set submit=false to send raw keys (e.g. control sequences).',
+      '(submit=true), so `input` is run as a command line. Set submit=false to send raw keys (e.g. control sequences). ' +
+      'Output is collected until it goes quiet or wait_ms elapses; a long-running command keeps running, so read the ' +
+      'rest later with mesh_terminal_read. Read-only command lines run without an approval prompt.',
     annotations: { destructiveHint: true },
-    confirmSummary: ({ session_id, input }) => `Send to terminal ${session_id}:\n${input}`,
+    confirmSummary: ({ session_id, input }) => {
+      let where = `terminal ${session_id}`;
+      try { const t = terminals.get(session_id); where = `${t.shell} terminal ${session_id}`; } catch {}
+      return `Type into ${where}: ${input}`;
+    },
+    // A submitted command line in a known shell can be auto-approved when it is
+    // read-only. Raw keystrokes (submit=false) always ask.
+    autoApprove: async ({ session_id, input, submit }) => {
+      if (submit === false) return false;
+      const session = terminals.get(session_id);
+      let dialect = { cmd: 'cmd', powershell: 'powershell', 'powershell-user': 'powershell', shell: 'posix' }[session.shell];
+      if (session.shell === 'terminal-user') {
+        const node = await getNode(session.nodeId);
+        dialect = node && (isWindowsNode(node) ? 'cmd' : 'posix');
+      }
+      return Boolean(dialect) && isReadOnlyCommand(input, dialect);
+    },
     schema: {
       session_id: z.string().describe('Session ID from mesh_terminal_open'),
       input: z.string().describe('Text to send'),
       submit: z.boolean().optional().describe('Append a carriage return (default true)'),
-      wait_ms: z.number().int().positive().optional().describe('Max ms to wait for output to settle (default 15000)'),
+      wait_ms: z.number().int().positive().max(600_000).optional().describe('Max ms to wait for output to settle (default 15000, max 600000)'),
     },
     handler: async ({ session_id, input, submit, wait_ms }) => {
       const session = terminals.get(session_id);
@@ -730,7 +878,7 @@ export function registerTools({ server, client, policy, gate, config }) {
       while (common < limit && before[common] === after[common]) common++;
       if (common > 0) common -= 1;
       const delta = after.slice(common).join('\n').replace(/\n{3,}/g, '\n\n').trim();
-      return deviceResult(delta || '(no new output)', `Terminal ${session_id} output:`);
+      return deviceResult(delta || '(no new output)', `[${session.shell} ${session_id}] > ${input}`);
     },
   });
 

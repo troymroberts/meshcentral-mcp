@@ -125,6 +125,7 @@ export class FileTunnel {
       state.reject(new Error(`File exceeds the ${state.maxBytes}-byte limit`));
       return;
     }
+    state.arm();
     if (header === BLOCK_LAST) {
       clearTimeout(state.timer);
       this.#downloadState = null;
@@ -155,7 +156,7 @@ export class FileTunnel {
 
   // ── Public operations ─────────────────────────────────────────────────
 
-  async list(dirPath, timeoutMs = 15_000) {
+  async list(dirPath, timeoutMs = 30_000) {
     const resp = await this.#request({ action: 'ls', path: dirPath }, { timeoutMs });
     if (resp.dir == null) throw new Error(`Path not found or inaccessible: ${dirPath}`);
     return resp.dir;
@@ -176,16 +177,22 @@ export class FileTunnel {
   copy(scpath, dspath, names) { this.#sendJson({ action: 'copy', scpath, dspath, names }); }
   move(scpath, dspath, names) { this.#sendJson({ action: 'move', scpath, dspath, names }); }
 
+  // timeoutMs is a stall timeout: it restarts on every received block, so a large
+  // file on a slow link is not cut off as long as data keeps flowing.
   async download(filePath, { maxBytes = Infinity, timeoutMs = 120_000 } = {}) {
     if (this.#downloadState) throw new Error('Another download is in progress');
     const id = crypto.randomBytes(8).toString('hex');
     return new Promise((resolve, reject) => {
       const state = { id, chunks: [], size: 0, maxBytes, resolve, reject };
-      state.timer = setTimeout(() => {
-        try { this.#sendJson({ action: 'download', sub: 'stop', id }); } catch {}
-        this.#downloadState = null;
-        reject(new Error('Download timed out'));
-      }, timeoutMs);
+      state.arm = () => {
+        clearTimeout(state.timer);
+        state.timer = setTimeout(() => {
+          try { this.#sendJson({ action: 'download', sub: 'stop', id }); } catch {}
+          this.#downloadState = null;
+          reject(new Error(`Download stalled: no data for ${Math.round(timeoutMs / 1000)}s (received ${state.size} bytes)`));
+        }, timeoutMs);
+      };
+      state.arm();
       this.#downloadState = state;
       try {
         this.#sendJson({ action: 'download', sub: 'start', path: filePath, id });
@@ -216,12 +223,14 @@ export class FileTunnel {
     if (r.action === 'uploaderror') throw new Error('Upload failed to complete on the remote device');
   }
 
-  async find(dirPath, filter, timeoutMs = 20_000) {
+  // Resolves { results, complete }; complete is false when timeoutMs expired
+  // before the agent signalled the end of the search.
+  async find(dirPath, filter, timeoutMs = 120_000) {
     if (this.#findState) throw new Error('Another search is in progress');
     const reqid = `find_${++this.#reqId}`;
     return new Promise((resolve) => {
-      const state = { reqid, results: [], resolve };
-      state.timer = setTimeout(() => { this.#findState = null; resolve(state.results); }, timeoutMs);
+      const state = { reqid, results: [], resolve: (results) => resolve({ results, complete: true }) };
+      state.timer = setTimeout(() => { this.#findState = null; resolve({ results: state.results, complete: false }); }, timeoutMs);
       this.#findState = state;
       this.#sendJson({ action: 'findfile', path: dirPath, filter, reqid });
     });
