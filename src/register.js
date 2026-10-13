@@ -83,7 +83,8 @@ export function registerTools({ server, client, policy, gate, config }) {
           if (confirmable && policy.needsConfirm(tier)) {
             const readOnly = policy.autoApproveReadOnly && autoApprove && (await autoApprove(args).catch(() => false));
             if (!readOnly) {
-              const gateResult = await gate.check(name, await confirmSummary(args), args, tier);
+              const summary = await humanizeIds(await confirmSummary(args), args);
+              const gateResult = await gate.check(name, summary, args, tier);
               if (gateResult) return gateResult;
             }
           }
@@ -108,6 +109,58 @@ export function registerTools({ server, client, policy, gate, config }) {
     nodeCache = Object.values(res.nodes || {}).flat();
     nodeCacheAt = Date.now();
     return nodeCache;
+  }
+
+  let meshCache = null;
+  let meshCacheAt = 0;
+  async function allMeshes() {
+    if (meshCache && Date.now() - meshCacheAt < 30_000) return meshCache;
+    const res = await client.sendCommand({ action: 'meshes' }, 15_000);
+    meshCache = Array.isArray(res.meshes) ? res.meshes : [];
+    meshCacheAt = Date.now();
+    return meshCache;
+  }
+
+  // Approval prompts are read by a human: replace node/group IDs (and session IDs)
+  // with device and group names. Duplicate device names get an ID suffix so they
+  // stay distinguishable. Best effort - on any lookup failure the IDs remain.
+  async function humanizeIds(summary, args = {}) {
+    if (typeof summary !== 'string') return summary;
+    let out = summary;
+    try {
+      const nodes = await allNodes();
+      const nameCount = new Map();
+      for (const n of nodes) nameCount.set(n.name, (nameCount.get(n.name) ?? 0) + 1);
+      const label = (n) => (nameCount.get(n.name) > 1 ? `${n.name} (${n._id.slice(-6)})` : n.name);
+      const byRef = (ref) => nodes.find((n) => n._id === ref) || nodes.find((n) => n._id.split('/')[2] === ref);
+
+      // Session-scoped tools: say which device the session is on.
+      if (args.session_id) {
+        let nodeId = null;
+        try { nodeId = terminals.get(args.session_id).nodeId; } catch {}
+        if (!nodeId) try { nodeId = desktops.get(args.session_id).nodeId; } catch {}
+        const n = nodeId && byRef(nodeId);
+        if (n) out = out.split(args.session_id).join(`${args.session_id} on ${label(n)}`);
+      }
+
+      const refs = new Set([
+        ...(out.match(/node\/[\w.-]*\/[\w@$-]+/g) || []),
+        ...[args.node_id, ...(Array.isArray(args.node_ids) ? args.node_ids : [])].filter((v) => typeof v === 'string'),
+      ]);
+      for (const ref of [...refs].sort((a, b) => b.length - a.length)) {
+        const n = byRef(ref);
+        if (n) out = out.split(ref).join(label(n));
+      }
+    } catch {}
+    try {
+      const meshRef = args.meshid ?? args.mesh_id;
+      if (typeof meshRef === 'string') {
+        const meshes = await allMeshes();
+        const m = meshes.find((x) => x._id === meshRef || x._id === meshId(meshRef));
+        if (m?.name) out = out.split(meshRef).join(`"${m.name}"`);
+      }
+    } catch {}
+    return out;
   }
 
   async function getNode(idOrName) {
