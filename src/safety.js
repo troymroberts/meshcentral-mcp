@@ -28,9 +28,30 @@ export function sanitizeDeep(value, depth = 0) {
   return value;
 }
 
+// Over the limit, keep the start (context) and the larger end (for logs and
+// command output the newest lines and the final error are usually at the end).
 export function truncate(text, maxChars) {
   if (text.length <= maxChars) return text;
-  return text.slice(0, maxChars) + `\n... [truncated: ${text.length - maxChars} more characters]`;
+  const head = Math.floor(maxChars * 0.25);
+  const tail = maxChars - head;
+  return text.slice(0, head) + `\n... [truncated: ${text.length - maxChars} characters omitted] ...\n` + text.slice(-tail);
+}
+
+// Keep only the first `head` and/or last `tail` lines of device output.
+export function trimLines(text, { head = null, tail = null } = {}) {
+  if (typeof text !== 'string' || (head == null && tail == null)) return text;
+  const lines = text.split(/\r?\n/);
+  const keepHead = head ?? 0;
+  const keepTail = tail ?? 0;
+  if (lines.length <= keepHead + keepTail || (head == null && lines.length <= keepTail) || (tail == null && lines.length <= keepHead)) {
+    return text;
+  }
+  const omitted = lines.length - keepHead - keepTail;
+  return [
+    ...lines.slice(0, keepHead),
+    `... [${omitted} lines omitted] ...`,
+    ...(keepTail ? lines.slice(-keepTail) : []),
+  ].join('\n');
 }
 
 export const UNTRUSTED_NOTE =
@@ -158,6 +179,7 @@ export class ConfirmationGate {
   #sessionGrants;
   #grantedTools = new Set();
   #grantedTiers = new Set();
+  #grantedDevices = new Set(); // `${tier}|${nodeId}`
 
   constructor({ mode = 'auto', server = null, elicitTimeoutMs = DEFAULT_ELICIT_TIMEOUT_MS, sessionGrants = true } = {}) {
     if (!['auto', 'elicit', 'token', 'off'].includes(mode)) {
@@ -173,23 +195,28 @@ export class ConfirmationGate {
     return Boolean(this.#server?.getClientCapabilities?.()?.elicitation);
   }
 
-  // Session-wide approvals granted by the human through elicitation.
-  isGranted(toolName, tier) {
-    return this.#grantedTools.has(toolName) || this.#grantedTiers.has(tier);
+  // Session-wide approvals granted by the human through elicitation. A device
+  // grant covers one tier on one device; a call touching several devices needs
+  // a grant for every one of them.
+  isGranted(toolName, tier, nodeIds = []) {
+    if (this.#grantedTools.has(toolName) || this.#grantedTiers.has(tier)) return true;
+    return nodeIds.length > 0 && nodeIds.every((id) => this.#grantedDevices.has(`${tier}|${id}`));
   }
 
-  grant({ tool = null, tier = null }) {
+  grant({ tool = null, tier = null, nodeId = null }) {
     if (tool) this.#grantedTools.add(tool);
-    if (tier) this.#grantedTiers.add(tier);
+    if (nodeId && tier) this.#grantedDevices.add(`${tier}|${nodeId}`);
+    else if (tier) this.#grantedTiers.add(tier);
   }
 
   revokeAll() {
     this.#grantedTools.clear();
     this.#grantedTiers.clear();
+    this.#grantedDevices.clear();
   }
 
   grants() {
-    return { tools: [...this.#grantedTools], tiers: [...this.#grantedTiers] };
+    return { tools: [...this.#grantedTools], tiers: [...this.#grantedTiers], devices: [...this.#grantedDevices] };
   }
 
   issueToken(toolName, args, now = Date.now()) {
@@ -217,9 +244,10 @@ export class ConfirmationGate {
     return `${summary}\n\n(${toolName}, tier ${tier}: ${TIERS[tier] ?? ''})`;
   }
 
-  static decisionSchema(toolName, tier, sessionGrants) {
+  static decisionSchema(toolName, tier, sessionGrants, device = null) {
     const choices = [['once', 'Approve this action once']];
     if (sessionGrants) {
+      if (device) choices.push(['device', `Approve all tier ${tier} actions on ${device.label} for this session`]);
       choices.push(['tool', `Approve all ${toolName} calls for this session`]);
       choices.push(['tier', `Approve all tier ${tier} actions (${TIERS[tier] ?? tier}) for this session`]);
     }
@@ -239,48 +267,69 @@ export class ConfirmationGate {
   }
 
   // Returns null when the call may proceed, or a tool result to return instead.
-  async check(toolName, summary, args, tier = 'X') {
-    if (this.#mode === 'off') return null;
-    if (this.isGranted(toolName, tier)) return null;
+  async check(toolName, summary, args, tier = 'X', opts = {}) {
+    return (await this.decide(toolName, summary, args, tier, opts)).block;
+  }
+
+  // Like check(), but also reports how the decision was reached (for the audit
+  // log): via = off | grant | prompt | token | denied.
+  //   opts.nodeIds   devices the call touches (device grants, "this device" choice)
+  //   opts.device    { id, label } offered as a per-device grant when one device is involved
+  //   opts.forcePrompt  ignore session grants and offer only "approve once" (used
+  //                  for actions that could cut off remote access)
+  async decide(toolName, summary, args, tier = 'X', opts = {}) {
+    const { nodeIds = [], device = null, forcePrompt = false } = opts;
+    if (this.#mode === 'off') return { block: null, via: 'off' };
+    if (!forcePrompt && this.isGranted(toolName, tier, nodeIds)) return { block: null, via: 'grant' };
+    const offerGrants = this.#sessionGrants && !forcePrompt;
 
     if (this.#mode !== 'token' && this.#canElicit()) {
       try {
         const res = await this.#server.elicitInput(
           {
             message: ConfirmationGate.promptMessage(toolName, tier, summary),
-            requestedSchema: ConfirmationGate.decisionSchema(toolName, tier, this.#sessionGrants),
+            requestedSchema: ConfirmationGate.decisionSchema(toolName, tier, offerGrants, device),
           },
           { timeout: this.#elicitTimeoutMs }
         );
-        if (res.action !== 'accept') return errorResult(`Action not approved by the user (${res.action}).`);
+        if (res.action !== 'accept') {
+          return { block: errorResult(`Action not approved by the user (${res.action}).`), via: 'denied' };
+        }
         const decision = res.content?.decision ?? 'once';
-        if (this.#sessionGrants && decision === 'tool') this.grant({ tool: toolName });
-        else if (this.#sessionGrants && decision === 'tier') this.grant({ tier });
-        return null;
+        if (offerGrants && decision === 'tool') this.grant({ tool: toolName });
+        else if (offerGrants && decision === 'tier') this.grant({ tier });
+        else if (offerGrants && decision === 'device' && device) this.grant({ tier, nodeId: device.id });
+        return { block: null, via: 'prompt' };
       } catch (err) {
         if (this.#mode === 'elicit' || !isUnsupportedElicitation(err)) {
-          return errorResult(`Could not obtain user approval: ${err.message}`);
+          return { block: errorResult(`Could not obtain user approval: ${err.message}`), via: 'denied' };
         }
         // the client cannot elicit after all: fall through to token mode
       }
     } else if (this.#mode === 'elicit') {
-      return errorResult('This action requires user approval, but the MCP client does not support elicitation.');
+      return {
+        block: errorResult('This action requires user approval, but the MCP client does not support elicitation.'),
+        via: 'denied',
+      };
     }
 
     if (args?.confirm_token) {
       const r = this.redeemToken(toolName, args);
-      return r.ok ? null : errorResult(r.reason);
+      return r.ok ? { block: null, via: 'token' } : { block: errorResult(r.reason), via: 'denied' };
     }
     const token = this.issueToken(toolName, args);
     return {
-      content: [{
-        type: 'text',
-        text:
-          `CONFIRMATION REQUIRED\n\n${summary}\n(${toolName}, tier ${tier})\n\n` +
-          'Show this action to the user and get their explicit approval. If they approve, call the tool again ' +
-          `with exactly the same arguments plus confirm_token: "${token}". The token is single-use, bound to these ` +
-          'arguments, and expires in 10 minutes.',
-      }],
+      via: 'token-issued',
+      block: {
+        content: [{
+          type: 'text',
+          text:
+            `CONFIRMATION REQUIRED\n\n${summary}\n(${toolName}, tier ${tier})\n\n` +
+            'Show this action to the user and get their explicit approval. If they approve, call the tool again ' +
+            `with exactly the same arguments plus confirm_token: "${token}". The token is single-use, bound to these ` +
+            'arguments, and expires in 10 minutes.',
+        }],
+      },
     };
   }
 }

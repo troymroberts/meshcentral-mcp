@@ -52,7 +52,8 @@ test('sanitizeDeep walks objects and arrays', () => {
 
 test('truncate adds a marker only when over limit', () => {
   assert.equal(truncate('abc', 10), 'abc');
-  assert.match(truncate('abcdef', 3), /^abc\n\.\.\. \[truncated: 3 more/);
+  const t = truncate('a'.repeat(10) + 'MIDDLE' + 'z'.repeat(30), 20);
+  assert.match(t, /^aaaaa\n\.\.\. \[truncated: 26 characters omitted\] \.\.\.\nz{15}$/); // 25% head, 75% tail
 });
 
 test('isServerError / serverResult map result strings', () => {

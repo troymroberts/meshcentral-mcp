@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { agentRisk } from '../agent-guard.js';
 import { waitForFrame, vkFor, VK, noFrameMessage, DEFAULT_MAX_WIDTH } from '../desktop.js';
 import { textResult, errorResult } from '../safety.js';
 
@@ -77,6 +78,7 @@ export default function register(ctx) {
 
   define({
     name: 'mesh_desktop_click', tier: 'X', title: 'Desktop click',
+    change: () => false, // individual inputs stay in the local record only; session open/close go to the device log
     description: 'Click (or double-click) at native pixel coordinates in a desktop session, then return a fresh screenshot.',
     annotations: { destructiveHint: true },
     confirmSummary: ({ session_id, x, y, button }) => `${button || 'left'}-click at (${x},${y}) in desktop ${session_id}`,
@@ -97,6 +99,7 @@ export default function register(ctx) {
 
   define({
     name: 'mesh_desktop_move', tier: 'X', title: 'Desktop mouse move',
+    change: () => false, // individual inputs stay in the local record only; session open/close go to the device log
     description: 'Move the mouse to native pixel coordinates (no click).',
     annotations: { destructiveHint: true },
     confirmSummary: ({ session_id, x, y }) => `Move mouse to (${x},${y}) in desktop ${session_id}`,
@@ -113,9 +116,11 @@ export default function register(ctx) {
 
   define({
     name: 'mesh_desktop_type', tier: 'X', title: 'Desktop type text',
+    change: () => false, // individual inputs stay in the local record only; session open/close go to the device log
     description: 'Type a string into the desktop session (sent as Unicode key events), then return a screenshot.',
     annotations: { destructiveHint: true },
     confirmSummary: ({ session_id, text }) => `Type into desktop ${session_id}: ${text}`,
+    agentRisk: async ({ text }) => agentRisk(text),
     schema: {
       session_id: z.string().describe('Session ID'),
       text: z.string().describe('Text to type'),
@@ -130,6 +135,7 @@ export default function register(ctx) {
 
   define({
     name: 'mesh_desktop_key', tier: 'X', title: 'Desktop key press',
+    change: () => false, // individual inputs stay in the local record only; session open/close go to the device log
     description: `Press a special key by name (then screenshot). Known: ${Object.keys(VK).join(', ')}.`,
     annotations: { destructiveHint: true },
     confirmSummary: ({ session_id, key }) => `Press ${key} in desktop ${session_id}`,
@@ -149,6 +155,7 @@ export default function register(ctx) {
 
   define({
     name: 'mesh_desktop_hotkey', tier: 'X', title: 'Desktop hotkey',
+    change: () => false, // individual inputs stay in the local record only; session open/close go to the device log
     description:
       'Press a key chord in a desktop session (modifiers held while the final key is pressed), then screenshot. ' +
       'Give keys in order, e.g. ["ctrl","s"], ["alt","f4"], ["ctrl","shift","escape"], ["win","d"]. ' +
@@ -172,6 +179,7 @@ export default function register(ctx) {
 
   define({
     name: 'mesh_desktop_scroll', tier: 'X', title: 'Desktop scroll',
+    change: () => false, // individual inputs stay in the local record only; session open/close go to the device log
     description: 'Scroll the mouse wheel at native pixel coordinates (positive = up), then screenshot.',
     annotations: { destructiveHint: true },
     confirmSummary: ({ session_id, amount }) => `Scroll ${amount} in desktop ${session_id}`,
@@ -190,6 +198,7 @@ export default function register(ctx) {
 
   define({
     name: 'mesh_desktop_set_display', tier: 'X', title: 'Select desktop monitor',
+    change: () => false, // individual inputs stay in the local record only; session open/close go to the device log
     description: 'Switch which monitor an open desktop session shows (use the display numbers from a screenshot; 65535 = all).',
     schema: {
       session_id: z.string().describe('Session ID'),

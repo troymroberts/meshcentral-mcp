@@ -5,7 +5,7 @@ import { textResult, deviceResult, errorResult } from '../safety.js';
 
 // RF — remote data read
 export default function register(ctx) {
-  const { define, client, getNode, resolveNodeId, isWindowsNode, runShell, runConsole, withFileTunnel } = ctx;
+  const { define, client, requireNode, resolveNodeId, isWindowsNode, runShell, runConsole, withFileTunnel } = ctx;
 
   // ════════════════════════════════════════════════════════════════════════
   // RF — remote data read
@@ -16,8 +16,7 @@ export default function register(ctx) {
     description: 'Live system summary from the device agent (OS, hardware, network).',
     schema: { node_id: z.string().describe('Device node ID or name (must be online)') },
     handler: async ({ node_id }) => {
-      const node = await getNode(node_id);
-      if (!node) return errorResult(`No device matching '${node_id}'`);
+      const node = await requireNode(node_id);
       const out = await runConsole(node, 'sysinfo');
       return deviceResult(out || '(no response from agent)', `Agent info for ${node.name}:`);
     },
@@ -30,8 +29,7 @@ export default function register(ctx) {
       '(the native MeshCentral software action is broken on some server versions and is not used).',
     schema: { node_id: z.string().describe('Device node ID or name (must be online)') },
     handler: async ({ node_id }) => {
-      const node = await getNode(node_id);
-      if (!node) return errorResult(`No device matching '${node_id}'`);
+      const node = await requireNode(node_id);
       const win = isWindowsNode(node);
       const cmd = win
         ? "Get-ItemProperty HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*, " +

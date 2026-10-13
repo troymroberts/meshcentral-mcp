@@ -76,6 +76,19 @@ Confirmation prefers MCP **elicitation** (a prompt to the human). When the clien
 cannot elicit, it falls back to a single-use token **bound to the exact tool
 arguments** — a guard against accidental calls, not a replacement for human review.
 
+Further controls on top of the tiers:
+
+- `MESH_MCP_AUTO_APPROVE_READONLY` (default on) — commands the read-only classifier
+  recognises skip confirmation. The built-in diagnostics (`mesh_health_check`,
+  `mesh_event_log`, `mesh_services`) are tier RF and never need confirmation.
+- `MESH_MCP_SESSION_APPROVAL` (default on) — prompts can grant approval for one
+  device, one tool, or one tier for the rest of the session.
+- **Mesh Agent protection** — actions that could cut off remote access (stopping,
+  restarting, killing, reconfiguring or removing the agent; power-off or sleep;
+  agent updates and core pushes) are refused regardless of tier unless the call
+  passes `allow_agent_disruption: true`, and then always prompt; session grants
+  never cover them.
+
 ---
 
 ## 4. Local file access
@@ -97,3 +110,5 @@ write anywhere the process can, including its own `.env`. Not recommended.
 3. **Withhold `MESHRIGHT_REMOTECOMMAND`** if the agent never needs to run commands
 4. **Enable consent flags** on device groups for terminal/desktop/file sessions
 5. **Keep `MESH_LOCAL_FILE_ROOT`** restricted to a dedicated directory
+6. **Keep `MESH_MCP_DEVICE_EVENTS` on** so device changes made through the MCP appear
+   in MeshCentral's own per-device event log, attributed to the MCP account

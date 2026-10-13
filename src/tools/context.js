@@ -1,9 +1,12 @@
+import crypto from 'crypto';
 import { z } from 'zod';
 import { FileTunnel } from '../file-tunnel.js';
 import { TerminalManager } from '../terminal.js';
 import { DesktopManager } from '../desktop.js';
 import { isReadOnlyCommand } from '../readonly.js';
 import { sanitizeText, errorResult, isServerError, UNTRUSTED_NOTE } from '../safety.js';
+import { AGENT_GUARD_MESSAGE } from '../agent-guard.js';
+import { AuditLog, redactArgs } from '../audit.js';
 
 // Shared state and helpers for the tool modules in this directory: the define()
 // wrapper (policy gating + confirmation), node/group resolution, and the shell,
@@ -38,8 +41,13 @@ function imageResult(enc, header, session = null) {
 // Capability tier of each tool. Drives both profile gating and whether the tool
 // is treated as confirmable (X/WF/P/A tools can require approval).
 const CONFIRMABLE = new Set(['X', 'WF', 'P', 'A']);
+// Tiers whose calls change a device (posted to its MeshCentral event log under
+// MESH_MCP_DEVICE_EVENTS=changes unless auto-approved as read-only).
+const CHANGE_TIERS = new Set(['W', 'X', 'WF', 'P', 'A']);
 
-export function createContext({ server, client, policy, gate, config }) {
+const firstLine = (result) => String(result?.content?.[0]?.text ?? '').split('\n')[0].slice(0, 300);
+
+export function createContext({ server, client, policy, gate, config, audit = new AuditLog() }) {
   const terminals = new TerminalManager({
     client,
     idleMinutes: config.terminalIdleMinutes,
@@ -54,13 +62,30 @@ export function createContext({ server, client, policy, gate, config }) {
 
   const registered = [];
 
-  // define() applies policy gating, confirmation, and uniform error handling.
-  // autoApprove(args) may return true for calls that are plainly read-only; they
-  // skip confirmation when MESH_MCP_AUTO_APPROVE_READONLY is on.
-  function define({ name, tier, title, description, schema = {}, annotations = {}, confirmSummary = null, autoApprove = null, handler }) {
+  // define() applies policy gating, the Mesh Agent guard, confirmation, the
+  // activity record, and uniform error handling.
+  //   autoApprove(args)  true for plainly read-only calls; they skip confirmation
+  //                      when MESH_MCP_AUTO_APPROVE_READONLY is on
+  //   agentRisk(args)    reason string when the call would stop/kill/modify the Mesh
+  //                      Agent: refused unless allow_agent_disruption, and then
+  //                      always prompted (session grants do not apply)
+  //   audit              false keeps a tool out of the activity record (lookups)
+  //   change(args)       whether a call changes the device; default: W/X/WF/P/A
+  //                      tiers unless it was read-only
+  //   describe(args)     record summary for tools without a confirmSummary
+  function define({
+    name, tier, title, description, schema = {}, annotations = {}, confirmSummary = null, autoApprove = null,
+    agentRisk = null, audit: auditable = tier !== 'R', change = null, describe = null, handler,
+  }) {
     if (!policy.allows(name, tier)) return;
     const confirmable = confirmSummary && CONFIRMABLE.has(tier);
     const inputSchema = { ...schema };
+    if (agentRisk) {
+      inputSchema.allow_agent_disruption = z
+        .boolean()
+        .optional()
+        .describe('Only when the human explicitly asked to stop/restart/modify the Mesh Agent itself. Always prompts; can permanently cut off remote access.');
+    }
     if (confirmable) {
       inputSchema.confirm_token = z
         .string()
@@ -81,22 +106,77 @@ export function createContext({ server, client, policy, gate, config }) {
         },
       },
       async (args, extra) => {
+        const started = Date.now();
+        let approval = 'not-required';
+        let summary = null;
+        let nodes = [];
+        let result;
         try {
-          if (confirmable && policy.needsConfirm(tier)) {
-            const readOnly = policy.autoApproveReadOnly && autoApprove && (await autoApprove(args).catch(() => false));
-            if (!readOnly) {
-              const summary = await humanizeIds(await confirmSummary(args), args);
-              const gateResult = await gate.check(name, summary, args, tier);
-              if (gateResult) return gateResult;
+          nodes = await nodesOf(args);
+          const readOnly = Boolean(autoApprove) && (await autoApprove(args).catch(() => false));
+          const risk = agentRisk && !readOnly ? await agentRisk(args) : null;
+          if (risk && !args.allow_agent_disruption) {
+            approval = 'blocked';
+            result = errorResult(`${AGENT_GUARD_MESSAGE}\nReason: ${risk}.`);
+          } else {
+            if (confirmable && (risk || (policy.needsConfirm(tier) && !(readOnly && policy.autoApproveReadOnly)))) {
+              summary = await humanizeIds(await confirmSummary(args), args);
+              const prompt = risk ? `WARNING - MAY CUT OFF REMOTE ACCESS (${risk}).\n${summary}` : summary;
+              const device = nodes.length === 1 ? { id: nodes[0].id, label: nodes[0].name } : null;
+              const d = await gate.decide(name, prompt, args, tier, {
+                nodeIds: nodes.map((n) => n.id), device, forcePrompt: Boolean(risk),
+              });
+              approval = d.via;
+              if (d.block) result = d.block;
+            } else if (readOnly) {
+              approval = 'auto-readonly';
             }
+            if (!result) result = await handler(args, extra);
           }
-          return await handler(args, extra);
         } catch (err) {
-          return errorResult(err.message);
+          result = errorResult(err.message);
         }
+        if (auditable && approval !== 'token-issued') {
+          try {
+            if (summary == null) {
+              summary = describe ? await describe(args)
+                : confirmSummary ? await humanizeIds(await confirmSummary(args), args)
+                : `${name} ${JSON.stringify(redactArgs(args))}`;
+            }
+            const executed = !['blocked', 'denied'].includes(approval);
+            const isChange = executed && (change ? change(args, approval) : CHANGE_TIERS.has(tier) && approval !== 'auto-readonly');
+            const text = firstLine(result);
+            const background = Boolean(result?.isError) && /Tracked as job (job_\w+)/.test(text);
+            audit.record({
+              tool: name, tier, nodes, summary, approval, ok: !result?.isError || background,
+              ...(background ? { outcome: `continuing as background ${text.match(/job_\w+/)[0]}` } : {}),
+              ...(result?.isError && !background ? { error: text } : {}),
+              ms: Date.now() - started, change: isChange,
+            });
+          } catch {}
+        }
+        return result;
       }
     );
     registered.push({ name, tier });
+  }
+
+  // Devices a call touches, for approval scoping and the activity record.
+  async function nodesOf(args = {}) {
+    const refs = [];
+    if (typeof args.node_id === 'string') refs.push(args.node_id);
+    if (Array.isArray(args.node_ids)) refs.push(...args.node_ids.filter((r) => typeof r === 'string'));
+    if (typeof args.session_id === 'string') {
+      try { refs.push(terminals.get(args.session_id).nodeId); } catch {}
+      try { refs.push(desktops.get(args.session_id).nodeId); } catch {}
+    }
+    if (typeof args.job_id === 'string' && jobs.has(args.job_id)) refs.push(jobs.get(args.job_id).nodeId);
+    const out = [];
+    for (const ref of refs) {
+      const n = await getNode(ref).catch(() => null);
+      if (n && !out.some((x) => x.id === n._id)) out.push({ id: n._id, name: n.name });
+    }
+    return out;
   }
 
   // ── id helpers ──────────────────────────────────────────────────────────
@@ -165,23 +245,50 @@ export function createContext({ server, client, policy, gate, config }) {
     return out;
   }
 
-  async function getNode(idOrName) {
+  // Find a device by full ID, ID hash, or name. Names match exactly, then
+  // case-insensitively, then as a unique partial match ignoring punctuation
+  // ("prudecon file" finds "Prudecon-File"). Several matches throw, listing them.
+  // Returns null when nothing matches.
+  const squash = (v) => String(v ?? '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  async function getNode(ref) {
+    if (typeof ref !== 'string' || !ref) return null;
     const nodes = await allNodes();
+    const byId = nodes.find((n) => n._id === ref) || nodes.find((n) => n._id.split('/')[2] === ref);
+    if (byId) return byId;
+    const pick = (matches) => {
+      if (matches.length === 1) return matches[0];
+      if (matches.length > 1) {
+        throw new Error(
+          `'${ref}' matches ${matches.length} devices: ` +
+          matches.slice(0, 15).map((n) => `${n.name} (${n._id})`).join(', ') + '. Use the exact name or node ID.'
+        );
+      }
+      return null;
+    };
+    const lower = ref.toLowerCase();
+    const needle = squash(ref);
     return (
-      nodes.find((n) => n._id === idOrName) ||
-      nodes.find((n) => n.name === idOrName) ||
-      nodes.find((n) => n._id.split('/')[2] === idOrName) ||
-      null
+      pick(nodes.filter((n) => n.name === ref)) ||
+      pick(nodes.filter((n) => n.name?.toLowerCase() === lower)) ||
+      (needle ? pick(nodes.filter((n) => squash(n.name).includes(needle))) : null)
     );
   }
 
-  // Resolve a node ID or name to a full node id. A '/'-form is trusted as-is;
-  // a bare token is matched against the node list by id-hash or name, else
-  // completed as node/<domain>/<token> so the server returns a clean error.
+  // getNode, but a miss is an error that lists known device names.
+  async function requireNode(ref) {
+    const node = await getNode(ref);
+    if (node) return node;
+    const names = (await allNodes()).map((n) => n.name).sort();
+    throw new Error(
+      `No device matching '${ref}'. Known devices${names.length > 30 ? ' (first 30)' : ''}: ` +
+      `${names.slice(0, 30).join(', ') || '(none visible to this account)'}.`
+    );
+  }
+
+  // Resolve a node ID or name to a full node id. A '/'-form is trusted as-is.
   async function resolveNodeId(raw) {
     if (!raw || raw.includes('/')) return raw;
-    const node = await getNode(raw);
-    return node ? node._id : `node/${client.domain}/${raw}`;
+    return (await requireNode(raw))._id;
   }
   const resolveNodeIds = (arr) => Promise.all(arr.map(resolveNodeId));
 
@@ -195,16 +302,50 @@ export function createContext({ server, client, policy, gate, config }) {
   // from the tier-R inventory tools without running anything on the device.
   const CONN_BITS = [[1, 'agent'], [2, 'intel-amt-cira'], [4, 'intel-amt'], [8, 'relay'], [16, 'mqtt']];
   const POWER_STATES = ['unknown', 'on', 'sleep', 'sleep', 'sleep', 'hibernate', 'off', 'present'];
-  const withStatus = (node) => {
+  const ago = (ms) => {
+    const s = Math.max(0, Math.round((Date.now() - ms) / 1000));
+    if (s < 120) return `${s}s ago`;
+    if (s < 7200) return `${Math.round(s / 60)}m ago`;
+    if (s < 172800) return `${Math.round(s / 3600)}h ago`;
+    return `${Math.round(s / 86400)}d ago`;
+  };
+  // last: optional { time, addr } from lastConnect()/lastConnects().
+  const withStatus = (node, last = null) => {
     const conn = node?.conn ?? 0;
     const connection = CONN_BITS.filter(([bit]) => conn & bit).map(([, label]) => label);
     return {
       online: Boolean(conn & 1),
       connection: connection.length ? connection : ['offline'],
       ...(node?.pwr != null ? { power: POWER_STATES[node.pwr] ?? `state ${node.pwr}` } : {}),
+      ...(last?.time ? {
+        last_connected: new Date(last.time).toISOString(),
+        last_connected_ago: ago(last.time),
+        ...(last.addr ? { last_address: last.addr } : {}),
+      } : {}),
       ...node,
     };
   };
+
+  async function lastConnect(nodeId) {
+    try {
+      const r = await client.sendCommand({ action: 'lastconnect', nodeid: nodeId }, 10_000);
+      return r?.time ? { time: r.time, addr: r.addr } : null;
+    } catch { return null; }
+  }
+
+  async function lastConnects() {
+    try {
+      const r = await client.sendCommand({ action: 'lastconnects' }, 15_000);
+      return r?.lastconnects ?? {};
+    } catch { return {}; }
+  }
+
+  // A device's MeshCentral event log, newest first. filter: one of the server's
+  // action filters (manual, runcommands, relaylog, agentlog, changenode, ...).
+  async function deviceEvents(nodeId, { limit = 50, filter = null } = {}) {
+    const res = await client.sendCommand({ action: 'events', nodeid: nodeId, limit, ...(filter ? { filter } : {}) }, 20_000);
+    return Array.isArray(res?.events) ? res.events : [];
+  }
 
   // Shell dialect the read-only classifier should apply to a command for a node.
   // type 0 (auto) on Windows may run under either CMD or PowerShell, so it must
@@ -241,22 +382,92 @@ export function createContext({ server, client, policy, gate, config }) {
     'location', 'timerinfo', 'wslist', 'agentsize', 'vm', 'apf', 'privacybar', 'kvmmode', 'wpfhwacceleration',
   ]);
 
+  // ── Shell commands and background jobs ──────────────────────────────────
   // Run a shell command and return the agent's captured output. type: 1 CMD, 2 PS, 3 *nix, 0 auto.
   // On success the agent replies {action:'msg', type:'runcommands', result:<output>}; on failure the
   // server replies {action:'runcommands', result:<status>}, where result is a status, not output.
+  //
   // The agent runs one runcommands at a time per device. A second one sent while
   // it is busy is refused with a console message ("already busy") and never gets
-  // a reply, so calls are queued per node and the refusal is surfaced at once.
+  // a reply. So every command is a job, queued per node; the queue is held until
+  // the agent actually replies (up to MESH_COMMAND_MAX_TIMEOUT_SECONDS), even if
+  // the caller stopped waiting, and the late result stays fetchable by job ID.
   const shellQueues = new Map(); // nodeId -> tail promise
+  const jobs = new Map(); // jobId -> job
   const BUSY_RE = /run commands can'?t execute, already busy/i;
+  const MAX_JOBS = 200;
+  const jobFinished = (job) => job.status === 'done' || job.status === 'failed';
 
-  async function runShell(node, command, type = 0, timeoutMs = 30_000) {
+  // visible: listed by mesh_job_status. Jobs behind other tools stay hidden
+  // unless they outlive their caller's wait.
+  function startShellJob(node, command, type = 0, { visible = true } = {}) {
+    const job = {
+      id: `job_${crypto.randomBytes(4).toString('hex')}`,
+      nodeId: node._id, nodeName: node.name, command, type, visible,
+      status: 'queued', queuedAt: Date.now(), startedAt: null, endedAt: null, output: null, error: null,
+    };
+    const lifetimeMs = config.commandMaxTimeoutSeconds * 1000;
     const prev = shellQueues.get(node._id) ?? Promise.resolve();
-    const run = prev.catch(() => {}).then(() => runShellNow(node, command, type, timeoutMs));
-    const tail = run.catch(() => {});
-    shellQueues.set(node._id, tail);
-    tail.then(() => { if (shellQueues.get(node._id) === tail) shellQueues.delete(node._id); });
-    return run;
+    job.promise = prev.then(async () => {
+      job.status = 'running';
+      job.startedAt = Date.now();
+      try {
+        job.output = cleanShellOutput(await runShellNow(node, command, type, lifetimeMs), node, type);
+        job.status = 'done';
+      } catch (err) {
+        job.error = err.message;
+        job.status = 'failed';
+      } finally {
+        job.endedAt = Date.now();
+      }
+    });
+    shellQueues.set(node._id, job.promise);
+    job.promise.then(() => { if (shellQueues.get(node._id) === job.promise) shellQueues.delete(node._id); });
+    jobs.set(job.id, job);
+    if (jobs.size > MAX_JOBS) {
+      for (const [id, j] of jobs) { if (jobs.size <= MAX_JOBS) break; if (jobFinished(j)) jobs.delete(id); }
+    }
+    return job;
+  }
+
+  // Wait up to ms for a job to finish (no-op if it already has).
+  async function waitForJob(job, ms) {
+    if (jobFinished(job) || ms <= 0) return;
+    let timer;
+    await Promise.race([job.promise, new Promise((r) => { timer = setTimeout(r, ms); timer.unref?.(); })]);
+    clearTimeout(timer);
+  }
+
+  const stillRunningMessage = (job, waitedMs) =>
+    `${job.status === 'queued' ? 'Still queued behind an earlier command' : 'Still running'} on ${job.nodeName} ` +
+    `after ${Math.round(waitedMs / 1000)}s. Tracked as job ${job.id}: fetch the result later with mesh_job_status ` +
+    `(job_id "${job.id}"). Further commands to this device queue behind it; a terminal (mesh_terminal_*) is not blocked.`;
+
+  // Run and wait up to timeoutMs. On timeout the job keeps running and the error names it.
+  async function runShell(node, command, type = 0, timeoutMs = 30_000) {
+    const job = startShellJob(node, command, type, { visible: false });
+    await waitForJob(job, timeoutMs);
+    if (job.status === 'done') return job.output;
+    if (job.status === 'failed') throw new Error(job.error);
+    job.visible = true;
+    throw new Error(stillRunningMessage(job, timeoutMs));
+  }
+
+  // CMD on Windows (type 1, and type 0 which runs CMD) wraps output in its banner,
+  // the echoed command line and a trailing "exit"; strip those.
+  function cleanShellOutput(out, node, type) {
+    if (typeof out !== 'string' || !(type === 1 || (type === 0 && isWindowsNode(node)))) return out;
+    const lines = out.split(/\r?\n/);
+    let i = 0;
+    if (/^Microsoft Windows \[Version/.test(lines[i] ?? '')) i++;
+    if (/^\(c\) .*Microsoft Corporation/.test(lines[i] ?? '')) i++;
+    while (i < lines.length && !lines[i].trim()) i++;
+    if (/^[A-Za-z]:\\[^>]*>/.test(lines[i] ?? '')) i++; // echoed command line
+    let end = lines.length;
+    while (end > i && !lines[end - 1].trim()) end--;
+    if (end > i && /^[A-Za-z]:\\[^>]*>exit$/.test(lines[end - 1].trim())) end--;
+    while (end > i && !lines[end - 1].trim()) end--;
+    return lines.slice(i, end).join('\n');
   }
 
   async function runShellNow(node, command, type, timeoutMs) {
@@ -265,10 +476,9 @@ export function createContext({ server, client, policy, gate, config }) {
       offBusy = client.on('msg', (m) => {
         if (m.type === 'console' && m.nodeid === node._id && BUSY_RE.test(String(m.value ?? ''))) {
           reject(new Error(
-            `${node.name}'s agent is still running an earlier command (it may be one that timed out here and is still ` +
-            'executing on the device), so it refused this one. Use a persistent terminal (mesh_terminal_open + ' +
-            'mesh_terminal_input) instead - it is not blocked by this - or wait for the earlier command to finish; ' +
-            'restarting the Mesh Agent service clears a stuck command.'
+            `${node.name}'s agent is busy with a command this server did not start (another MeshCentral user or tool, ` +
+            'or one from before this server restarted), so it refused this one. Use a persistent terminal ' +
+            '(mesh_terminal_open + mesh_terminal_input) - it is not blocked by this - or wait for that command to finish.'
           ));
         }
       });
@@ -282,9 +492,8 @@ export function createContext({ server, client, policy, gate, config }) {
     } catch (err) {
       if (/did not answer/.test(err.message)) {
         throw new Error(
-          `No output from ${node.name} within ${Math.round(timeoutMs / 1000)}s. The command may still be running on the device ` +
-          '(it is not cancelled, and the agent refuses further commands until it ends). Retry with a larger timeout_seconds, ' +
-          'narrow the query (e.g. -MaxEvents / --since), or use an interactive terminal (mesh_terminal_*) for long-running work.'
+          `No reply from ${node.name} within ${Math.round(timeoutMs / 1000)}s (MESH_COMMAND_MAX_TIMEOUT_SECONDS); the ` +
+          'command may still be running on the device and blocking further commands there.'
         );
       }
       throw err;
@@ -295,6 +504,19 @@ export function createContext({ server, client, policy, gate, config }) {
     return typeof res.result === 'string' ? res.result : '';
   }
 
+  // The agent's process list: { pid: { cmd, user, ... } }, or null when the device
+  // does not answer.
+  async function processList(nodeId) {
+    const msgs = await client.collectMessages(
+      (m) => m.action === 'msg' && m.type === 'ps' && m.nodeid === nodeId,
+      () => client.sendRaw({ action: 'msg', type: 'ps', nodeid: nodeId }),
+      { idleMs: 500, firstMs: 15_000, maxMs: 20_000 }
+    );
+    if (!msgs.length) return null;
+    let value = msgs[msgs.length - 1].value;
+    try { value = JSON.parse(value); } catch {}
+    return value;
+  }
 
   // Agent console command (type 4). Output arrives as pushed msg/console frames, not a reply.
   async function runConsole(node, command, { idleMs = 1500, maxMs = 45_000 } = {}) {
@@ -323,8 +545,11 @@ export function createContext({ server, client, policy, gate, config }) {
   }
 
   return {
-    server, client, policy, gate, config, registered, terminals, desktops, define,
-    meshId, allNodes, allMeshes, humanizeIds, getNode, resolveNodeId, resolveNodeIds, isWindowsNode, withStatus,
-    RUN_TYPE_LABEL, readOnlyFor, withProgress, READONLY_AGENT_CONSOLE, runShell, runConsole, withFileTunnel, imageResult,
+    server, client, policy, gate, config, audit, registered, terminals, desktops, define,
+    meshId, allNodes, allMeshes, humanizeIds, getNode, requireNode, resolveNodeId, resolveNodeIds, isWindowsNode,
+    withStatus, lastConnect, lastConnects, deviceEvents, ago,
+    RUN_TYPE_LABEL, readOnlyFor, withProgress, READONLY_AGENT_CONSOLE,
+    runShell, startShellJob, waitForJob, jobs, jobFinished, stillRunningMessage,
+    runConsole, processList, withFileTunnel, imageResult,
   };
 }

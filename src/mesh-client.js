@@ -199,9 +199,15 @@ export class MeshCentralClient {
         return;
       }
     } else if (msg.action && this.#pendingByAction.has(msg.action)) {
-      // 2) Some list actions (meshes, users, events, ...) reply without a responseid:
+      // 2) Some list actions (meshes, users, events, ...) reply without a responseid.
+      //    Many echo `tag`, which sendCommand sets to the responseid, so concurrent
+      //    requests (e.g. events for two devices) get their own reply; otherwise
       //    resolve the oldest outstanding request for that action.
-      const p = this.#pendingByAction.get(msg.action)[0];
+      const queue = this.#pendingByAction.get(msg.action);
+      const p =
+        (msg.tag != null && queue.find((x) => x.responseid === msg.tag)) ||
+        (msg.nodeid != null && queue.find((x) => x.nodeid === msg.nodeid)) ||
+        queue[0];
       this.#removePending(p);
       p.resolve(msg);
       return;
@@ -235,7 +241,7 @@ export class MeshCentralClient {
     const responseid = `mcp_${++this.#requestId}`;
     const action = command.action;
     return new Promise((resolve, reject) => {
-      const p = { responseid, action, resolve, reject };
+      const p = { responseid, action, nodeid: command.nodeid, resolve, reject };
       p.timer = setTimeout(() => {
         this.#removePending(p);
         reject(new Error(`MeshCentral did not answer '${action}' within ${timeoutMs / 1000}s`));
@@ -244,7 +250,7 @@ export class MeshCentralClient {
       if (!this.#pendingByAction.has(action)) this.#pendingByAction.set(action, []);
       this.#pendingByAction.get(action).push(p);
       try {
-        this.#ws.send(JSON.stringify({ ...command, responseid }));
+        this.#ws.send(JSON.stringify({ tag: responseid, ...command, responseid }));
       } catch (err) {
         this.#removePending(p);
         reject(err);

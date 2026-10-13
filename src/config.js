@@ -110,6 +110,10 @@ export function loadConfig(env = process.env) {
     // Default / maximum wait for mesh_run_command output.
     commandTimeoutSeconds: int(env.MESH_COMMAND_TIMEOUT_SECONDS, 300),
     commandMaxTimeoutSeconds: int(env.MESH_COMMAND_MAX_TIMEOUT_SECONDS, 3600),
+    // Local JSON-lines activity record ('off' disables) and what is also posted to
+    // each device's MeshCentral event log: off | changes | all.
+    auditLog: auditPath(env.MESH_MCP_AUDIT_LOG),
+    deviceEvents: (env.MESH_MCP_DEVICE_EVENTS || 'changes').toLowerCase(),
     maxOutputChars: int(env.MESH_MCP_MAX_OUTPUT, 100_000),
     terminalIdleMinutes: int(env.MESH_TERMINAL_IDLE_MINUTES, 15),
     terminalMaxSessions: int(env.MESH_TERMINAL_MAX_SESSIONS, 5),
@@ -118,6 +122,11 @@ export function loadConfig(env = process.env) {
     // Frame interval (ms) requested while the agent is the only KVM viewer; 0 disables throttling.
     desktopIdleFrameMs: nonNegInt(env.MESH_DESKTOP_IDLE_FRAME_MS, 2000),
   };
+}
+
+function auditPath(value) {
+  if (value && /^(off|false|none|0)$/i.test(value.trim())) return null;
+  return value ? path.resolve(value) : path.join(REPO_ROOT, 'logs', 'audit.jsonl');
 }
 
 function bool(value, fallback) {

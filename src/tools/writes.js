@@ -4,22 +4,57 @@ import { textResult, serverResult, errorResult } from '../safety.js';
 
 // W — low-impact writes
 export default function register(ctx) {
-  const { define, client, meshId, resolveNodeId, resolveNodeIds, withFileTunnel } = ctx;
+  const { define, client, audit, meshId, resolveNodeId, resolveNodeIds, withFileTunnel } = ctx;
 
   // ════════════════════════════════════════════════════════════════════════
   // W — low-impact writes
   // ════════════════════════════════════════════════════════════════════════
 
   define({
-    name: 'mesh_set_notes', tier: 'W', title: 'Set device notes',
-    description: 'Set the notes/description on a device.',
+    name: 'mesh_set_notes', tier: 'W', title: 'Device notes',
+    description:
+      "Update a device's notes (the free-text Notes field in MeshCentral). Default mode \"append\" adds a " +
+      'timestamped line and keeps existing notes; "replace" overwrites them (use only when asked). For a record of ' +
+      'what was diagnosed or done, prefer mesh_log_event (it goes in the device history).',
     schema: {
       node_id: z.string().describe('Device node ID or name'),
-      notes: z.string().describe('Notes text'),
+      notes: z.string().describe('Text to add (append) or the full new notes (replace)'),
+      mode: z.enum(['append', 'replace']).optional().describe('Default "append"'),
     },
-    handler: async ({ node_id, notes }) => {
-      await client.sendRaw({ action: 'setNotes', id: await resolveNodeId(node_id), notes });
-      return textResult('Notes set (the server does not acknowledge this; verify with mesh_get_notes).');
+    describe: async ({ notes, mode }) => `${mode === 'replace' ? 'Replace' : 'Append to'} device notes: ${notes.slice(0, 200)}`,
+    handler: async ({ node_id, notes, mode }) => {
+      const id = await resolveNodeId(node_id);
+      let text = notes;
+      if (mode !== 'replace') {
+        const current = await client.sendCommand({ action: 'getNotes', id }, 10_000).then((r) => r?.notes ?? '').catch(() => null);
+        if (current == null) return errorResult('Could not read the current notes, so nothing was changed (use mode "replace" to overwrite).');
+        const stamp = new Date().toISOString().slice(0, 16).replace('T', ' ');
+        text = `${current ? current.replace(/\s+$/, '') + '\n' : ''}[${stamp} UTC] ${notes}`;
+      }
+      await client.sendRaw({ action: 'setNotes', id, notes: text });
+      const check = await client.sendCommand({ action: 'getNotes', id }, 10_000).then((r) => r?.notes ?? '').catch(() => null);
+      if (check !== text) return errorResult('Notes update sent but could not be confirmed (no SETNOTES right on this device?).');
+      return textResult(mode === 'replace' ? 'Notes replaced.' : `Note appended. Device notes now:\n${text}`);
+    },
+  });
+
+  define({
+    name: 'mesh_log_event', tier: 'W', title: 'Record device event',
+    description:
+      "Add an entry to a device's MeshCentral event log (its Events tab), attributed to this account and prefixed " +
+      '"[MCP note]". Use it at the end of a diagnostic or service session to record what was found, what was ' +
+      'changed, and what is still open, so the next session (human or AI) can read it with mesh_device_history. ' +
+      'Keep it factual and concise (max ~3000 characters).',
+    schema: {
+      node_ids: z.array(z.string()).min(1).describe('Device(s) the entry applies to'),
+      message: z.string().min(1).max(3400).describe('What was found / done / left open'),
+    },
+    change: () => false, // the call itself is the event; do not echo it
+    describe: async ({ message }) => `Record event: ${message.slice(0, 200)}`,
+    handler: async ({ node_ids, message }) => {
+      const ids = await resolveNodeIds(node_ids);
+      for (const id of ids) await audit.deviceEvent(id, `[MCP note] ${message}`);
+      return textResult(`Recorded on ${ids.length} device(s). It appears in their MeshCentral Events tab and in mesh_device_history (filter "manual").`);
     },
   });
 

@@ -191,3 +191,40 @@ export function waitForOutput(session, { quietMs = 800, maxMs = 15_000 } = {}) {
     timer.unref?.(); hard.unref?.();
   });
 }
+
+// Shell prompts, matched against the last non-empty rendered line.
+export const PROMPT_RE = {
+  powershell: /^PS [^\n]*>$/,
+  cmd: /^[A-Za-z]:\\[^>\n]*>$/,
+  posix: /[$#%]$/,
+};
+
+// Wait until a command has finished: output has been quiet for `quietMs` and
+// the last rendered line is a shell prompt again. Returns early with
+// { dead: true } if nothing at all (not even the echo of the input) arrives
+// within `echoMs`, and with { prompt: false } when `maxMs` elapses first (the
+// command is still running, or an interactive program has the terminal).
+export function waitForPrompt(session, { promptRe, quietMs = 400, maxMs = 60_000, echoMs = 6_000 } = {}) {
+  return new Promise((resolve) => {
+    const started = Date.now();
+    let bytes = 0;
+    let lastData = Date.now();
+    const atPrompt = () => {
+      const lines = session.renderedLines();
+      for (let i = lines.length - 1; i >= 0; i--) {
+        if (lines[i].trim()) return promptRe.test(lines[i].trim());
+      }
+      return false;
+    };
+    const finish = (r) => { off(); clearInterval(tick); resolve({ bytes, ms: Date.now() - started, ...r }); };
+    const off = session.onData((buf) => { bytes += buf.length; lastData = Date.now(); });
+    const tick = setInterval(() => {
+      const now = Date.now();
+      if (!session.isOpen) return finish({ prompt: false, closed: true });
+      if (bytes === 0 && now - started >= echoMs) return finish({ prompt: false, dead: true });
+      if (bytes > 0 && now - lastData >= quietMs && promptRe && atPrompt()) return finish({ prompt: true });
+      if (now - started >= maxMs) return finish({ prompt: false });
+    }, 100);
+    tick.unref?.();
+  });
+}
