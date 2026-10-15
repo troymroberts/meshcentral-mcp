@@ -154,7 +154,7 @@ try {
   process.exit(1);
 }
 
-const { registered, known, terminals, desktops } = registerTools({ server, client, policy, gate, config, audit });
+const { registered, known, terminals, desktops, chats } = registerTools({ server, client, policy, gate, config, audit });
 for (const [setting, names] of [['MESH_MCP_ENABLE_TOOLS', config.enableTools], ['MESH_MCP_DISABLE_TOOLS', config.disableTools]]) {
   const unknown = names.filter((n) => !known.includes(n));
   if (unknown.length) console.error(`[meshcentral-mcp] WARNING: ${setting} names unknown tool(s): ${unknown.join(', ')}`);
@@ -163,6 +163,7 @@ for (const [setting, names] of [['MESH_MCP_ENABLE_TOOLS', config.enableTools], [
 function shutdown() {
   try { terminals.closeAll(); } catch {}
   try { desktops.closeAll(); } catch {}
+  try { chats.closeAll(); } catch {}
   try { client.disconnect(); } catch {}
   process.exit(0);
 }

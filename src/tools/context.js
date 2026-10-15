@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { FileTunnel } from '../file-tunnel.js';
 import { TerminalManager } from '../terminal.js';
 import { DesktopManager } from '../desktop.js';
+import { ChatManager } from '../chat.js';
 import { isReadOnlyCommand } from '../readonly.js';
 import { sanitizeText, errorResult, isServerError, UNTRUSTED_NOTE } from '../safety.js';
 import { AGENT_GUARD_MESSAGE } from '../agent-guard.js';
@@ -56,6 +57,7 @@ export function createContext({ server, client, policy, gate, config, audit = ne
     maxSessions: config.desktopMaxSessions,
     idleFrameMs: config.desktopIdleFrameMs,
   });
+  const chats = new ChatManager({ client, idleMinutes: config.chatIdleMinutes ?? 30 });
 
   const registered = [];
   const known = []; // every tool name, registered or not (to catch typos in ENABLE/DISABLE_TOOLS)
@@ -214,6 +216,9 @@ export function createContext({ server, client, policy, gate, config, audit = ne
     if (typeof args.session_id === 'string') {
       try { refs.push(terminals.get(args.session_id).nodeId); } catch {}
       try { refs.push(desktops.get(args.session_id).nodeId); } catch {}
+    }
+    if (typeof args.chat_id === 'string') {
+      try { refs.push(chats.get(args.chat_id).nodeId); } catch {}
     }
     if (typeof args.job_id === 'string' && jobs.has(args.job_id)) refs.push(jobs.get(args.job_id).nodeId);
     const out = [];
@@ -635,7 +640,7 @@ export function createContext({ server, client, policy, gate, config, audit = ne
   }
 
   return {
-    server, client, policy, gate, config, audit, registered, known, terminals, desktops, define,
+    server, client, policy, gate, config, audit, registered, known, terminals, desktops, chats, define,
     meshId, allNodes, allMeshes, humanizeIds, getNode, requireNode, resolveNodeId, resolveNodeIds, isWindowsNode,
     withStatus, lastConnect, lastConnects, deviceEvents, ago,
     RUN_TYPE_LABEL, readOnlyFor, withProgress, READONLY_AGENT_CONSOLE,

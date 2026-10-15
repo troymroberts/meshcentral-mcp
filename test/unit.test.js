@@ -154,3 +154,36 @@ test('resolveLocalPath blocks symlink escape', () => {
   assert.throws(() => resolveLocalPath('link/evil.txt', { env }), /symbolic link/);
   _resetLocalFileRoot();
 });
+
+// ── chat ────────────────────────────────────────────────────────────────
+
+test('ChatSession: join, typing, messages, unread tracking, waits and close', async () => {
+  const { EventEmitter } = await import('events');
+  const { ChatSession } = await import('../src/chat.js');
+  const ws = Object.assign(new EventEmitter(), { readyState: 1, sent: [], send(d) { this.sent.push(JSON.parse(d)); }, close() { this.readyState = 3; this.emit('close'); } });
+  const s = new ChatSession({ id: 'chat_x', ws, nodeId: 'node//a', nodeName: 'PC', idleMs: 60_000 });
+  assert.throws(() => s.send('hi'), /not opened the chat window/);
+  const joined = s.wait(() => s.connected, 1000);
+  ws.emit('message', Buffer.from('c'));
+  await joined;
+  assert.equal(s.connected, true);
+  ws.emit('message', Buffer.from(JSON.stringify({ ctrlChannel: '102938', type: 'ping' })));
+  assert.deepEqual(ws.sent.at(-1), { ctrlChannel: '102938', type: 'pong' });
+  s.send('hello');
+  assert.deepEqual(ws.sent.at(-1), { action: 'chat', msg: 'hello' });
+  ws.emit('message', Buffer.from(JSON.stringify({ action: 'outtext', value: true })));
+  assert.equal(s.typing, true);
+  const reply = s.wait(() => s.messages.length > 1, 1000);
+  ws.emit('message', Buffer.from(JSON.stringify({ action: 'chat', msg: 'printer jammed' })));
+  await reply;
+  assert.equal(s.typing, false);
+  assert.deepEqual(s.unread().map((m) => m.text), ['printer jammed']);
+  assert.deepEqual(s.unread(), []);
+  const t0 = Date.now();
+  await s.wait(() => false, 50);
+  assert.ok(Date.now() - t0 >= 45);
+  ws.close();
+  assert.equal(s.isOpen, false);
+  assert.match(s.closedReason, /user closed/);
+  assert.throws(() => s.send('x'), /closed/);
+});

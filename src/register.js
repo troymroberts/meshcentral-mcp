@@ -15,5 +15,5 @@ import endUser from './tools/end-user.js';
 export function registerTools({ server, client, policy, gate, config, audit }) {
   const ctx = createContext({ server, client, policy, gate, config, audit });
   for (const register of [inventory, remoteRead, diagnostics, writes, exec, desktop, fileWrite, lifecycle, admin, endUser]) register(ctx);
-  return { registered: ctx.registered, known: ctx.known, terminals: ctx.terminals, desktops: ctx.desktops };
+  return { registered: ctx.registered, known: ctx.known, terminals: ctx.terminals, desktops: ctx.desktops, chats: ctx.chats };
 }

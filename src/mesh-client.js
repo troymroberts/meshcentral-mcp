@@ -54,6 +54,29 @@ export class MeshCentralClient {
     return typeof id === 'string' ? id.split('/')[1] ?? '' : '';
   }
 
+  // ID of the logged-in user (user/<domain>/<name>), once userinfo has arrived.
+  get userId() {
+    return this.#userInfo?._id ?? null;
+  }
+
+  // ── MeshMessenger chat relay ──────────────────────────────────────────
+  // Joins the relay session meshmessenger/<nodeid>/<userid> as the technician
+  // side. The device side is the chat page the agent opens in the logged-in
+  // user's browser (action 'meshmessenger'); the relay pairs the two and sends
+  // 'c' to both once the page has connected. Returns the open WebSocket.
+  async openChatRelay(nodeid) {
+    if (!this.userId) await this.sendCommand({ action: 'userinfo' }, 15_000).catch(() => {});
+    if (!this.userId) throw new Error('Logged-in user ID unknown; cannot open a chat session.');
+    const query = `id=${encodeURIComponent(`meshmessenger/${nodeid}/${this.userId}`)}`;
+    const ws = new WebSocket(endpointUrl(this.#config.serverUrl, 'meshrelay.ashx', query), this.#wsOptions());
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => { try { ws.terminate(); } catch {} reject(new Error('Chat relay did not open.')); }, 15_000);
+      ws.once('open', () => { clearTimeout(timer); resolve(); });
+      ws.once('error', (err) => { clearTimeout(timer); reject(new Error(`Chat relay error: ${err.message}`)); });
+    });
+    return ws;
+  }
+
   #wsOptions() {
     const usernameB64 = Buffer.from(this.#config.username).toString('base64');
     const passwordB64 = Buffer.from(this.#config.password).toString('base64');
