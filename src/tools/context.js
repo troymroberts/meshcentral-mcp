@@ -162,6 +162,8 @@ export function createContext({ server, client, policy, gate, config, audit = ne
             }
             if (!result) {
               result = await handler(args, extra);
+              // A change can rename, retag or move devices: don't serve the cached list after it.
+              if (CHANGE_TIERS.has(tier)) { nodeCache = null; meshCache = null; }
               if (explain) result = withPurpose(result, args, approval);
             }
           }

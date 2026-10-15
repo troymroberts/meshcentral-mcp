@@ -59,7 +59,7 @@ test('list devices and resolve the test node by name', opts, async () => {
 });
 
 test('run_command captures output', opts, async () => {
-  const r = await call('mesh_run_command', { node_id: NODE, command: 'echo mcp_integration_marker' });
+  const r = await call('mesh_run_command', { purpose: 'Integration test: echo a marker', node_id: NODE, command: 'echo mcp_integration_marker' });
   assert.equal(r.isError, false, r.text);
   assert.match(r.text, /mcp_integration_marker/);
 });
@@ -72,8 +72,8 @@ test('interactive terminal keeps shell state across inputs', opts, async () => {
     const win = SHELL.includes('cmd') || SHELL.includes('powershell');
     const setCmd = win ? '$env:MCPVAR="persisted"' : 'MCPVAR=persisted';
     const getCmd = win ? 'Write-Output $env:MCPVAR' : 'echo $MCPVAR';
-    await call('mesh_terminal_input', { session_id: sid, input: setCmd });
-    const got = await call('mesh_terminal_input', { session_id: sid, input: getCmd });
+    await call('mesh_terminal_input', { purpose: 'Integration test: set a variable', session_id: sid, input: setCmd });
+    const got = await call('mesh_terminal_input', { purpose: 'Integration test: read the variable back', session_id: sid, input: getCmd });
     assert.match(got.text, /persisted/, got.text);
   } finally {
     await call('mesh_terminal_close', { session_id: sid });
