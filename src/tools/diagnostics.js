@@ -7,8 +7,36 @@ import { deviceResult, errorResult, trimLines, psQuote } from '../safety.js';
 // so the model does not improvise long scripts (which time out, need approval,
 // and block the device). Parameters are validated and quoted before they reach
 // a script; nothing user-supplied is ever interpolated raw.
+// Windows events that are known noise, left out of the health check's and the
+// chat diagnostics' error summaries (mesh_event_log still returns them). Each
+// is counted and reported as ignored, never dropped silently. Only add events
+// that are harmless on every machine they appear on.
+export const DEFAULT_IGNORED_EVENTS = [
+  { provider: 'vmStatsProvider', ids: [257, 259], reason: 'VMware Tools installed on a machine that is not a VMware VM' },
+];
+
+// PowerShell that loads System+Application events of the given levels from the
+// last `hours` into `$<name>`, leaving out `ignored` (provider + IDs) before the
+// -MaxEvents cap, and counts what was left out into `$<name>_ignored`.
+// Provider names are validated in config (no quotes), IDs are integers.
+export function winEventsScript(name, { hours, levels, max, ignored }) {
+  const ms = Math.round(hours * 3_600_000);
+  const select = `*[System[(${levels.map((l) => `Level=${l}`).join(' or ')}) and TimeCreated[timediff(@SystemTime) &lt;= ${ms}]]]`;
+  const suppress = ignored.map((e) =>
+    `*[System[Provider[@Name="${e.provider}"] and (${e.ids.map((i) => `EventID=${i}`).join(' or ')})]]`);
+  const xml = '<QueryList><Query Id="0">' + ['System', 'Application'].map((log) =>
+    `<Select Path="${log}">${select}</Select>` + suppress.map((x) => `<Suppress Path="${log}">${x}</Suppress>`).join('')
+  ).join('') + '</Query></QueryList>';
+  const counts = ignored.map((e) =>
+    `[pscustomobject]@{ source = '${e.provider} ${e.ids.join('/')}'; events = @(Get-WinEvent -FilterHashtable @{ ProviderName = '${e.provider}'; ` +
+    `Id = ${e.ids.join(', ')}; Level = ${levels.join(', ')}; StartTime = (Get-Date).AddHours(-${hours}) } -MaxEvents 50000).Count }`);
+  return `$${name} = @(Get-WinEvent -FilterXml ([xml]'${xml}') -MaxEvents ${max})\n` +
+    `$${name}_ignored = @(${counts.join(', ')}) | Where-Object { $_.events -gt 0 }`;
+}
+
 export default function register(ctx) {
-  const { define, requireNode, isWindowsNode, runShell, withProgress } = ctx;
+  const { define, requireNode, isWindowsNode, runShell, withProgress, config = {} } = ctx;
+  const ignoredEvents = [...(config.ignoreDefaultEvents === false ? [] : DEFAULT_IGNORED_EVENTS), ...(config.ignoreEvents ?? [])];
 
   // ── quoting helpers ───────────────────────────────────────────────────────
   const shQuote = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
@@ -52,7 +80,8 @@ $ignore = '^(gupdate|gupdatem|edgeupdate|edgeupdatem|GoogleUpdater.*|MapsBroker|
 $r.stopped_auto_services = @(Get-Service | Where-Object { $_.StartType -eq 'Automatic' -and $_.Status -ne 'Running' -and $_.Name -notmatch $ignore } |
   ForEach-Object { "$($_.Name) ($($_.DisplayName))" })
 $since = (Get-Date).AddDays(-${days})
-$ev = @(Get-WinEvent -FilterHashtable @{ LogName = 'System', 'Application'; Level = 1, 2; StartTime = $since } -MaxEvents 3000)
+${winEventsScript('ev', { hours: days * 24, levels: [1, 2], max: 3000, ignored: ignoredEvents })}
+$r.ignored_noise = @($ev_ignored)
 $r.errors_in_window = $ev.Count
 $r.top_errors = @($ev | Group-Object LogName, ProviderName, Id | Sort-Object Count -Descending | Select-Object -First 10 | ForEach-Object {
   $e = $_.Group[0]; $m = "$($e.Message)" -replace '\\s+', ' '
@@ -148,6 +177,7 @@ s recent_reboots; last -x reboot shutdown 2>/dev/null | head -5
     if (r.stopped_auto_services?.length) lines.push(`Auto-start services not running: ${r.stopped_auto_services.join('; ')}`);
     lines.push(`Errors (System+Application, window): ${r.errors_in_window >= 3000 ? '3000+ (capped)' : r.errors_in_window}`);
     for (const e of r.top_errors ?? []) lines.push(`  ${e.count}x ${e.log}/${e.source} ${e.id} (last ${e.last}): ${e.message}`);
+    for (const n of r.ignored_noise ?? []) lines.push(`  ignored as known noise: ${n.events}x ${n.source}`);
     if (r.critical_events?.length) lines.push(`Critical: ${r.critical_events.join('; ')}`);
     lines.push(`Unexpected shutdowns (30d): ${r.unexpected_shutdowns_30d}; pending reboot: ${r.pending_reboot?.length ? r.pending_reboot.join(', ') : 'no'}`);
     lines.push(`Last hotfix: ${r.last_hotfix ?? 'unknown'}; time sync: ${r.time_sync || 'unknown'}`);
@@ -194,8 +224,9 @@ s recent_reboots; last -x reboot shutdown 2>/dev/null | head -5
   const WIN_RECENT = (hours) => `
 $ErrorActionPreference = 'SilentlyContinue'
 $since = (Get-Date).AddHours(-${hours})
-$ev = @(Get-WinEvent -FilterHashtable @{ LogName = 'System', 'Application'; Level = 1, 2, 3; StartTime = $since } -MaxEvents 2000)
+${winEventsScript('ev', { hours, levels: [1, 2, 3], max: 2000, ignored: ignoredEvents })}
 "warnings and errors (System+Application): $($ev.Count)"
+$ev_ignored | ForEach-Object { "  ignored as known noise: $($_.events)x $($_.source)" }
 $ev | Group-Object LogName, ProviderName, Id | Sort-Object Count -Descending | Select-Object -First 15 | ForEach-Object {
   $e = $_.Group[0]; $m = "$($e.Message)" -replace '\\s+', ' '
   '  {0}x {1}/{2} {3} {4} (last {5}): {6}' -f $_.Count, $e.LogName, $e.ProviderName, $e.Id, $e.LevelDisplayName, $e.TimeCreated.ToString('s'), $m.Substring(0, [math]::Min(200, $m.Length)) }

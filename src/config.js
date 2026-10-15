@@ -79,6 +79,18 @@ function list(value) {
   return (value || '').split(',').map((s) => s.trim()).filter(Boolean);
 }
 
+// MESH_MCP_IGNORE_EVENTS: "Provider:id,id;Provider:id" - Windows events that are
+// known noise in this environment, left out of the health check's error summary.
+export function parseIgnoredEvents(value) {
+  const out = [];
+  for (const part of String(value ?? '').split(';').map((p) => p.trim()).filter(Boolean)) {
+    const m = part.match(/^([\w .\/-]{1,100}):\s*(\d+(?:\s*,\s*\d+)*)$/);
+    if (!m) return { error: `MESH_MCP_IGNORE_EVENTS: cannot read "${part}" (expected Provider:id,id).` };
+    out.push({ provider: m[1].trim(), ids: m[2].split(',').map((n) => parseInt(n, 10)) });
+  }
+  return { events: out };
+}
+
 function int(value, fallback) {
   const n = parseInt(value, 10);
   return Number.isFinite(n) && n > 0 ? n : fallback;
@@ -91,6 +103,8 @@ export function loadConfig(env = process.env) {
 
   const credentials = resolveCredentials(env);
   if (credentials.error) return { error: credentials.error };
+  const ignored = parseIgnoredEvents(env.MESH_MCP_IGNORE_EVENTS);
+  if (ignored.error) return { error: ignored.error };
 
   return {
     serverUrl,
@@ -108,6 +122,9 @@ export function loadConfig(env = process.env) {
     // Push chat messages to Claude Code as channel events (needs the session to load this server as a channel).
     chatPush: bool(env.MESH_MCP_CHAT_PUSH, true),
     chatDiagnostics: bool(env.MESH_MCP_CHAT_DIAGNOSTICS, true),
+    // Known-noise Windows events left out of health-check error summaries.
+    ignoreEvents: ignored.events,
+    ignoreDefaultEvents: bool(env.MESH_MCP_IGNORE_DEFAULT_EVENTS, true),
     // How long an approval prompt waits for the human.
     approvalTimeoutMs: int(env.MESH_MCP_APPROVAL_TIMEOUT_MINUTES, 30) * 60_000,
     // Default / maximum wait for mesh_run_command output.

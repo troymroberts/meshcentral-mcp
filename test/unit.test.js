@@ -255,3 +255,24 @@ test('ChatSession.setDiagnostics: wakes waiters and reports a diagnostics event'
   assert.deepEqual(events, ['diagnostics']);
   s.close();
 });
+
+test('parseIgnoredEvents: reads Provider:id lists and rejects bad entries', async () => {
+  const { parseIgnoredEvents } = await import('../src/config.js');
+  assert.deepEqual(parseIgnoredEvents(undefined), { events: [] });
+  assert.deepEqual(parseIgnoredEvents('vmStatsProvider:257, 259; Some-Source:7'),
+    { events: [{ provider: 'vmStatsProvider', ids: [257, 259] }, { provider: 'Some-Source', ids: [7] }] });
+  assert.match(parseIgnoredEvents("bad'name:1").error, /cannot read/);
+  assert.match(parseIgnoredEvents('NoIds').error, /cannot read/);
+});
+
+test('winEventsScript: suppresses ignored events before the cap and counts them', async () => {
+  const { winEventsScript } = await import('../src/tools/diagnostics.js');
+  const ps = winEventsScript('ev', { hours: 2, levels: [1, 2], max: 3000, ignored: [{ provider: 'vmStatsProvider', ids: [257, 259] }] });
+  assert.match(ps, /<Select Path="System">\*\[System\[\(Level=1 or Level=2\) and TimeCreated\[timediff\(@SystemTime\) &lt;= 7200000\]\]\]<\/Select>/);
+  assert.match(ps, /<Suppress Path="Application">\*\[System\[Provider\[@Name="vmStatsProvider"\] and \(EventID=257 or EventID=259\)\]\]<\/Suppress>/);
+  assert.match(ps, /-MaxEvents 3000\)/);
+  assert.match(ps, /\$ev_ignored = @\(\[pscustomobject\]@\{ source = 'vmStatsProvider 257\/259'; events = /);
+  const none = winEventsScript('ev', { hours: 1, levels: [1], max: 10, ignored: [] });
+  assert.doesNotMatch(none, /Suppress/);
+  assert.match(none, /\$ev_ignored = @\(\)/);
+});
