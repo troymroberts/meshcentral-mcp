@@ -38,9 +38,6 @@ function imageResult(enc, header, session = null) {
   };
 }
 
-// Capability tier of each tool. Drives both profile gating and whether the tool
-// is treated as confirmable (X/WF/P/A tools can require approval).
-const CONFIRMABLE = new Set(['X', 'WF', 'P', 'A']);
 // Tiers whose calls change a device (posted to its MeshCentral event log under
 // MESH_MCP_DEVICE_EVENTS=changes unless auto-approved as read-only).
 const CHANGE_TIERS = new Set(['W', 'X', 'WF', 'P', 'A']);
@@ -61,6 +58,7 @@ export function createContext({ server, client, policy, gate, config, audit = ne
   });
 
   const registered = [];
+  const known = []; // every tool name, registered or not (to catch typos in ENABLE/DISABLE_TOOLS)
 
   const PURPOSE_SCHEMA = z.string().min(1).describe(
     'One plain-English sentence for the human: what this command does and why you are running it now, ' +
@@ -90,12 +88,24 @@ export function createContext({ server, client, policy, gate, config, audit = ne
   //   describe(args)     record summary for tools without a confirmSummary
   //   explain            require a plain-English `purpose` argument: it leads the
   //                      approval prompt, heads the result and goes into the record
+  //   sensitive          true, or (args) => boolean: ask whatever the tier
+  //                      (one-off screenshots, clipboard, opening URLs on the device)
+  //   confirm            false for calls that never need approval (closing a session)
+  // A tool asks when its tier is in MESH_MCP_CONFIRM_TIERS (default X/WF/P/A),
+  // when it is sensitive, or when agentRisk fires.
   function define({
     name, tier, title, description, schema = {}, annotations = {}, confirmSummary = null, autoApprove = null,
-    agentRisk = null, audit: auditable = tier !== 'R', change = null, describe = null, explain = false, handler,
+    agentRisk = null, audit: auditable = tier !== 'R', change = null, describe = null, explain = false,
+    sensitive = false, confirm = true, handler,
   }) {
+    known.push(name);
     if (!policy.allows(name, tier)) return;
-    const confirmable = confirmSummary && CONFIRMABLE.has(tier);
+    const tierAsks = confirm && policy.needsConfirm(tier);
+    const asksFor = (args) => tierAsks || (confirm && (typeof sensitive === 'function' ? sensitive(args) : sensitive));
+    const confirmable = tierAsks || (confirm && Boolean(sensitive)) || Boolean(agentRisk);
+    const summarize = async (args) => confirmSummary ? confirmSummary(args)
+      : describe ? describe(args)
+      : `${title}: ${JSON.stringify(redactArgs(args))}`;
     // purpose goes first: clients show the leading arguments of a collapsed call.
     const inputSchema = explain ? { purpose: PURPOSE_SCHEMA, ...schema } : { ...schema };
     if (agentRisk) {
@@ -137,8 +147,8 @@ export function createContext({ server, client, policy, gate, config, audit = ne
             approval = 'blocked';
             result = errorResult(`${AGENT_GUARD_MESSAGE}\nReason: ${risk}.`);
           } else {
-            if (confirmable && (risk || (policy.needsConfirm(tier) && !(readOnly && policy.autoApproveReadOnly)))) {
-              summary = await humanizeIds(await confirmSummary(args), args);
+            if (risk || (asksFor(args) && !(readOnly && policy.autoApproveReadOnly))) {
+              summary = await humanizeIds(await summarize(args), args);
               const why = explain ? `Purpose: ${purposeOf(args)}\n` : '';
               const prompt = risk ? `WARNING - MAY CUT OFF REMOTE ACCESS (${risk}).\n${why}${summary}` : `${why}${summary}`;
               const device = nodes.length === 1 ? { id: nodes[0].id, label: nodes[0].name } : null;
@@ -623,7 +633,7 @@ export function createContext({ server, client, policy, gate, config, audit = ne
   }
 
   return {
-    server, client, policy, gate, config, audit, registered, terminals, desktops, define,
+    server, client, policy, gate, config, audit, registered, known, terminals, desktops, define,
     meshId, allNodes, allMeshes, humanizeIds, getNode, requireNode, resolveNodeId, resolveNodeIds, isWindowsNode,
     withStatus, lastConnect, lastConnects, deviceEvents, ago,
     RUN_TYPE_LABEL, readOnlyFor, withProgress, READONLY_AGENT_CONSOLE,

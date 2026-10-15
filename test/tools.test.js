@@ -421,3 +421,88 @@ test('mesh_add_user_to_group takes named rights and sends the MeshCentral bitmas
   assert.match((await call('mesh_add_user_to_group', { user_id: 'user//bob', mesh_id: 'mesh//g1' })).text, /full_rights/);
   cleanup();
 });
+
+// ── review follow-ups ───────────────────────────────────────────────────
+
+test('power actions send MeshCentral codes (reset=3, sleep=4) and AMT actions', async () => {
+  const { client, call, cleanup } = setup();
+  for (const action of ['reset', 'amt_power_on', 'amt_reset']) await call('mesh_power_action', { node_ids: ['web01'], action });
+  assert.deepEqual(client.sent.filter((c) => c.action === 'poweraction').map((c) => c.actiontype), [3, 302, 310]);
+  for (const action of ['sleep', 'poweroff', 'amt_power_off'])
+    assert.match((await call('mesh_power_action', { node_ids: ['web01'], action })).text, /BLOCKED/, action);
+  cleanup();
+});
+
+test('sensitive reads ask; re-capturing an approved desktop session does not', async () => {
+  const { call, cleanup } = setup({ confirmMode: 'token' });
+  assert.match((await call('mesh_get_clipboard', { node_id: 'web01' })).text, /CONFIRMATION REQUIRED[\s\S]*clipboard of web01/);
+  assert.match((await call('mesh_desktop_screenshot', { node_id: 'web01' })).text, /CONFIRMATION REQUIRED[\s\S]*screen/);
+  assert.doesNotMatch((await call('mesh_desktop_screenshot', { session_id: 'nope' })).text, /CONFIRMATION REQUIRED/);
+  assert.match((await call('mesh_open_url', { node_id: 'web01', url: 'https://example.com/' })).text, /CONFIRMATION REQUIRED/);
+  cleanup();
+});
+
+test('MESH_MCP_CONFIRM_TIERS=W makes W tools ask; unknown tiers are rejected', async () => {
+  const client = new FakeClient();
+  const server = new FakeServer();
+  registerTools({
+    server, client, config: CONFIG, audit: new AuditLog({ client }),
+    policy: new Policy({ profile: 'support', confirmTiers: ['W'] }), gate: new ConfirmationGate({ mode: 'token' }),
+  });
+  const r = await server.tools.mesh_wake_devices.cb({ node_ids: ['web01'] }, {});
+  assert.match(r.content[0].text, /CONFIRMATION REQUIRED/);
+  assert.throws(() => new Policy({ profile: 'support', confirmTiers: ['Q'] }), /Unknown tier/);
+});
+
+test('mesh_edit_device sends tags as an array and [] as the clearing empty string', async () => {
+  const { client, call, cleanup } = setup();
+  await call('mesh_edit_device', { node_id: 'web01', tags: ['dc', 'site-a'] });
+  await call('mesh_edit_device', { node_id: 'web01', tags: [] });
+  assert.deepEqual(client.sent.filter((c) => c.action === 'changedevice').map((c) => c.tags), [['dc', 'site-a'], '']);
+  cleanup();
+});
+
+test('bare usernames become MeshCentral user IDs; device rights exclude group-only bits', async () => {
+  const { client, call, cleanup } = setup({ profile: 'admin' });
+  await call('mesh_remove_user_from_group', { user_id: 'Bob', mesh_id: 'mesh//g1' });
+  await call('mesh_add_device_user', { node_id: 'web01', user_id: 'user//alice', full_rights: true });
+  assert.equal(client.sent.find((c) => c.action === 'removemeshuser').userid, 'user//bob');
+  const dev = client.sent.find((c) => c.action === 'adddeviceuser');
+  assert.deepEqual(dev.userids, ['user//alice']);
+  assert.equal(dev.rights & 7, 0);
+  cleanup();
+});
+
+test('mesh_create_share_link sends access, consent and a time window and returns the URL', async () => {
+  const { client, call, cleanup } = setup({ profile: 'admin' });
+  const send = client.sendCommand.bind(client);
+  client.sendCommand = async (cmd, t) => (cmd.action === 'createDeviceShareLink'
+    ? (client.sent.push(cmd), { ...cmd, url: 'https://mesh/sharing?c=abc', publicid: 'p1' }) : send(cmd, t));
+  const r = await call('mesh_create_share_link', { node_id: 'web01', guest_name: 'Vendor', access: ['desktop'], duration_minutes: 30 });
+  assert.match(r.text, /https:\/\/mesh\/sharing\?c=abc/);
+  const c = client.sent.find((x) => x.action === 'createDeviceShareLink');
+  assert.equal(c.p, 2);
+  assert.equal(c.consent, 0x01 | 0x08 | 0x40); // notify + prompt + toolbar
+  assert.equal(c.end - c.start, 1800);
+  cleanup();
+});
+
+test('mesh_file_download refuses to overwrite an existing local file', async () => {
+  const fs = await import('fs');
+  const os = await import('os');
+  const path = await import('path');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-dl-'));
+  const prev = process.env.MESH_LOCAL_FILE_ROOT;
+  process.env.MESH_LOCAL_FILE_ROOT = root;
+  fs.writeFileSync(path.join(root, 'a.txt'), 'keep');
+  const { call, cleanup } = setup();
+  try {
+    const r = await call('mesh_file_download', { node_id: 'web01', remote_path: '/etc/hosts', local_path: 'a.txt' });
+    assert.match(r.text, /already exists/);
+    assert.equal(fs.readFileSync(path.join(root, 'a.txt'), 'utf8'), 'keep');
+  } finally {
+    cleanup();
+    if (prev === undefined) delete process.env.MESH_LOCAL_FILE_ROOT; else process.env.MESH_LOCAL_FILE_ROOT = prev;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

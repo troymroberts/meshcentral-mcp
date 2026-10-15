@@ -10,20 +10,29 @@ export default function register(ctx) {
   // P — disruptive / agent lifecycle
   // ════════════════════════════════════════════════════════════════════════
 
-  const POWER_MAP = { sleep: 3, reset: 4, poweroff: 2, flash: 400, vibrate: 401 };
+  // MeshCentral poweraction actiontype codes (as in its web UI and meshctrl).
+  // 2-4 go through the Mesh Agent; 3xx go through Intel AMT and work while the
+  // OS - or the agent - is down, on devices with AMT provisioned.
+  const POWER_MAP = {
+    reset: 3, sleep: 4, poweroff: 2, flash: 400, vibrate: 401,
+    amt_power_on: 302, amt_power_off: 308, amt_reset: 310,
+  };
   define({
     name: 'mesh_power_action', tier: 'P', title: 'Power action',
-    description: 'Send a power action to devices: sleep, reset, poweroff, flash, vibrate.',
+    description:
+      'Send a power action to devices. Through the Mesh Agent: reset (reboot), sleep, poweroff, flash, vibrate. ' +
+      'Through Intel AMT (only on devices with AMT provisioned; works when the OS or agent is down): ' +
+      'amt_power_on, amt_power_off, amt_reset (hard reset). Wake-on-LAN: mesh_wake_devices.',
     annotations: { destructiveHint: true },
     confirmSummary: ({ node_ids, action }) => `Power action "${action}" on ${JSON.stringify(node_ids)}`,
     // Off or asleep, the device cannot be reached again unless Wake-on-LAN or
     // Intel AMT is available - treat like disrupting the agent.
-    agentRisk: async ({ action }) => (['poweroff', 'sleep'].includes(action)
+    agentRisk: async ({ action }) => (['poweroff', 'sleep', 'amt_power_off'].includes(action)
       ? `"${action}" takes the device offline; it can only come back via Wake-on-LAN, Intel AMT or someone on site`
       : null),
     schema: {
       node_ids: z.array(z.string()).describe('Device node IDs or names'),
-      action: z.enum(['sleep', 'reset', 'poweroff', 'flash', 'vibrate']).describe('Power action'),
+      action: z.enum(Object.keys(POWER_MAP)).describe('Power action'),
     },
     handler: async ({ node_ids, action }) =>
       serverResult(await client.sendCommand({ action: 'poweraction', nodeids: await resolveNodeIds(node_ids), actiontype: POWER_MAP[action] }, 15_000)),

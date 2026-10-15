@@ -8,11 +8,12 @@ import desktop from './tools/desktop.js';
 import fileWrite from './tools/file-write.js';
 import lifecycle from './tools/lifecycle.js';
 import admin from './tools/admin.js';
+import endUser from './tools/end-user.js';
 
 // Registers every tool the policy allows. Each module adds one tier's tools via
 // ctx.define(), which applies profile gating and confirmation uniformly.
 export function registerTools({ server, client, policy, gate, config, audit }) {
   const ctx = createContext({ server, client, policy, gate, config, audit });
-  for (const register of [inventory, remoteRead, diagnostics, writes, exec, desktop, fileWrite, lifecycle, admin]) register(ctx);
-  return { registered: ctx.registered, terminals: ctx.terminals, desktops: ctx.desktops };
+  for (const register of [inventory, remoteRead, diagnostics, writes, exec, desktop, fileWrite, lifecycle, admin, endUser]) register(ctx);
+  return { registered: ctx.registered, known: ctx.known, terminals: ctx.terminals, desktops: ctx.desktops };
 }

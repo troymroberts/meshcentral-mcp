@@ -4,7 +4,7 @@ import { textResult, deviceResult, serverResult, errorResult, isServerError } fr
 // R — inventory & monitoring
 export default function register(ctx) {
   const {
-    define, client, audit, allMeshes, processList, requireNode, resolveNodeId, withStatus, lastConnect, lastConnects, deviceEvents, ago,
+    define, client, audit, allMeshes, processList, requireNode, resolveNodeId, withStatus, lastConnect, lastConnects, deviceEvents,
   } = ctx;
 
   // One line of a device's MeshCentral event log.
@@ -250,7 +250,7 @@ export default function register(ctx) {
   });
 
   define({
-    name: 'mesh_list_processes', tier: 'R', title: 'List processes',
+    name: 'mesh_list_processes', tier: 'RF', title: 'List processes',
     description: 'Running processes on a device (via the agent process list).',
     schema: { node_id: z.string().describe('Device node ID or name (must be online)') },
     handler: async ({ node_id }) => {

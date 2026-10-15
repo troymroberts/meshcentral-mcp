@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { joinRemotePath } from '../file-tunnel.js';
+import { joinRemotePath, isWindowsPath } from '../file-tunnel.js';
 import { agentPathRisk } from '../agent-guard.js';
 import { textResult, serverResult, errorResult } from '../safety.js';
 
@@ -66,13 +66,15 @@ export default function register(ctx) {
       node_id: z.string().describe('Device node ID or name'),
       name: z.string().optional().describe('New display name'),
       host: z.string().optional().describe('New hostname/IP'),
-      tags: z.array(z.string()).optional().describe('Tags to set'),
+      tags: z.array(z.string().min(1).max(63).regex(/^[^,]+$/, 'tags cannot contain commas')).optional()
+        .describe('Tags to set (replaces all existing tags; [] clears them)'),
       rdpport: z.number().int().optional().describe('RDP port'),
       sshport: z.number().int().optional().describe('SSH port'),
     },
     handler: async ({ node_id, ...props }) => {
       const cmd = { action: 'changedevice', nodeid: await resolveNodeId(node_id), ...props };
-      if (Array.isArray(cmd.tags)) cmd.tags = JSON.stringify(cmd.tags);
+      // MeshCentral takes an array of tags; the empty string clears them.
+      if (Array.isArray(cmd.tags) && !cmd.tags.length) cmd.tags = '';
       return serverResult(await client.sendCommand(cmd, 15_000));
     },
   });
@@ -144,9 +146,10 @@ export default function register(ctx) {
     schema: {
       node_ids: z.array(z.string()).describe('Device node IDs or names'),
       message: z.string().describe('Notification message'),
+      title: z.string().max(128).optional().describe('Notification title (default "MeshCentral")'),
     },
-    handler: async ({ node_ids, message }) =>
-      serverResult(await client.sendCommand({ action: 'toast', nodeids: await resolveNodeIds(node_ids), msg: message }, 15_000)),
+    handler: async ({ node_ids, message, title }) =>
+      serverResult(await client.sendCommand({ action: 'toast', nodeids: await resolveNodeIds(node_ids), title: title || 'MeshCentral', msg: message }, 15_000)),
   });
 
   define({
@@ -197,6 +200,30 @@ export default function register(ctx) {
   // ── Remote file operations ─────────────────────────────────────────────────
   // mkdir is W; rename/copy/move can overwrite or displace files, so they are WF.
   // These agent file ops are not acknowledged, so each verifies via stat()/list().
+  // The agent does not acknowledge copy/move: poll the destination (and, for a
+  // move, the source) until every name has arrived/left, or give up.
+  async function verifyTransfer(t, verb, sourceDir, destDir, names, { maxMs = 10_000 } = {}) {
+    const fold = (n) => (isWindowsPath(destDir) ? n.toLowerCase() : n);
+    const deadline = Date.now() + maxMs;
+    let missing = names;
+    let left = [];
+    do {
+      await new Promise((r) => setTimeout(r, 500));
+      const dest = await t.list(destDir).then((d) => new Set(d.map((e) => fold(e.n)))).catch(() => null);
+      if (!dest) return errorResult(`${verb} requested, but ${destDir} could not be listed to confirm it.`);
+      missing = names.filter((n) => !dest.has(fold(n)));
+      if (verb === 'move' && !missing.length) {
+        const src = await t.list(sourceDir).then((d) => new Set(d.map((e) => fold(e.n)))).catch(() => new Set());
+        left = names.filter((n) => src.has(fold(n)));
+      }
+      if (!missing.length && !left.length) {
+        return textResult(`${verb === 'move' ? 'Moved' : 'Copied'} ${JSON.stringify(names)} from ${sourceDir} to ${destDir}`);
+      }
+    } while (Date.now() < deadline);
+    if (missing.length) return errorResult(`${verb} requested, but not in ${destDir} after ${maxMs / 1000}s: ${JSON.stringify(missing)}`);
+    return errorResult(`move requested; copied to ${destDir} but still present in ${sourceDir}: ${JSON.stringify(left)}`);
+  }
+
   define({
     name: 'mesh_file_mkdir', tier: 'W', title: 'Create remote directory',
     description: 'Create a directory on a device.',
@@ -250,8 +277,7 @@ export default function register(ctx) {
     handler: async ({ node_id, source_dir, dest_dir, names }) =>
       withFileTunnel(node_id, async (t) => {
         t.copy(source_dir, dest_dir, names);
-        await new Promise((r) => setTimeout(r, 500));
-        return textResult(`Copy of ${JSON.stringify(names)} from ${source_dir} to ${dest_dir} requested (verify with mesh_file_list).`);
+        return verifyTransfer(t, 'copy', source_dir, dest_dir, names);
       }),
   });
 
@@ -271,8 +297,7 @@ export default function register(ctx) {
     handler: async ({ node_id, source_dir, dest_dir, names }) =>
       withFileTunnel(node_id, async (t) => {
         t.move(source_dir, dest_dir, names);
-        await new Promise((r) => setTimeout(r, 500));
-        return textResult(`Move of ${JSON.stringify(names)} from ${source_dir} to ${dest_dir} requested (verify with mesh_file_list).`);
+        return verifyTransfer(t, 'move', source_dir, dest_dir, names);
       }),
   });
 }

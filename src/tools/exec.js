@@ -316,7 +316,7 @@ export default function register(ctx) {
   });
 
   define({
-    name: 'mesh_terminal_close', tier: 'X', title: 'Close terminal',
+    name: 'mesh_terminal_close', tier: 'X', title: 'Close terminal', confirm: false,
     description: 'Close an open terminal session.',
     schema: { session_id: z.string().describe('Session ID from mesh_terminal_open') },
     describe: async ({ session_id }) => `Close terminal ${session_id}`,

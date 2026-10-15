@@ -12,6 +12,11 @@ export default function register(ctx) {
   // are X (remote control of the console).
   define({
     name: 'mesh_desktop_screenshot', tier: 'RF', title: 'Desktop screenshot',
+    // A one-off capture shows the screen of a device nobody approved a session
+    // for (often with passwords or personal data on it): ask. Re-capturing an
+    // open, already-approved session does not.
+    sensitive: ({ session_id }) => !session_id,
+    confirmSummary: ({ node_id, session_id }) => session_id ? `Screenshot of desktop session ${session_id}` : `Take a screenshot of ${node_id}'s screen`,
     description:
       'Capture a screenshot of a device desktop as a JPEG image. Pass session_id to grab the current frame of an ' +
       'open session, or node_id to take a one-off capture. Returns the image plus its native pixel dimensions.',
@@ -197,7 +202,7 @@ export default function register(ctx) {
   });
 
   define({
-    name: 'mesh_desktop_set_display', tier: 'X', title: 'Select desktop monitor',
+    name: 'mesh_desktop_set_display', tier: 'X', title: 'Select desktop monitor', confirm: false,
     change: () => false, // individual inputs stay in the local record only; session open/close go to the device log
     description: 'Switch which monitor an open desktop session shows (use the display numbers from a screenshot; 65535 = all).',
     schema: {
@@ -220,7 +225,7 @@ export default function register(ctx) {
   });
 
   define({
-    name: 'mesh_desktop_close', tier: 'X', title: 'Close desktop session',
+    name: 'mesh_desktop_close', tier: 'X', title: 'Close desktop session', confirm: false,
     description: 'Close an open remote-desktop session.',
     schema: { session_id: z.string().describe('Session ID') },
     handler: async ({ session_id }) => {

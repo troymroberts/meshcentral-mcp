@@ -130,6 +130,8 @@ export class Policy {
     if (!p) throw new Error(`Unknown MESH_MCP_PROFILE '${profile}'. Valid: ${Object.keys(PROFILES).join(', ')}`);
     this.profile = profile;
     this.tiers = new Set(p.tiers);
+    const badTiers = (confirmTiers ?? []).filter((t) => !(t in TIERS));
+    if (badTiers.length) throw new Error(`Unknown tier(s) in MESH_MCP_CONFIRM_TIERS: ${badTiers.join(', ')}. Valid: ${Object.keys(TIERS).join(', ')}`);
     this.confirm = new Set(confirmTiers ?? DEFAULT_CONFIRM);
     this.enable = new Set(enableTools);
     this.disable = new Set(disableTools);

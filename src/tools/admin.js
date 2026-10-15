@@ -25,10 +25,16 @@ export const MESH_RIGHTS = {
 };
 export const FULL_RIGHTS = 0xFFFFFFFF;
 export const rightsMask = (names) => names.reduce((m, n) => m | MESH_RIGHTS[n], 0) >>> 0;
+// Group-management rights cannot be put on a direct user-to-device link.
+const GROUP_ONLY_RIGHTS = ['edit_group', 'manage_users', 'manage_devices'];
+const DEVICE_RIGHTS = Object.keys(MESH_RIGHTS).filter((n) => !GROUP_ONLY_RIGHTS.includes(n));
+const DEVICE_FULL_RIGHTS = (FULL_RIGHTS & ~7) >>> 0;
 
 // A — administration
 export default function register(ctx) {
   const { define, client, meshId, resolveNodeId } = ctx;
+  // A bare username becomes a MeshCentral user ID (user/<domain>/<lowercased name>).
+  const userId = (ref) => (String(ref).includes('/') ? ref : `user/${client.domain}/${String(ref).toLowerCase()}`);
 
   // ════════════════════════════════════════════════════════════════════════
   // A — estate / IAM administration
@@ -80,7 +86,7 @@ export default function register(ctx) {
     handler: async ({ user_id, mesh_id, rights, full_rights }) => {
       if (!full_rights && !rights?.length) return errorResult('Pass rights (a list of named rights) or full_rights: true.');
       const meshadmin = full_rights ? FULL_RIGHTS : rightsMask(rights);
-      return serverResult(await client.sendCommand({ action: 'addmeshuser', meshid: meshId(mesh_id), userids: [user_id], meshadmin }, 15_000));
+      return serverResult(await client.sendCommand({ action: 'addmeshuser', meshid: meshId(mesh_id), userids: [userId(user_id)], meshadmin }, 15_000));
     },
   });
 
@@ -94,22 +100,32 @@ export default function register(ctx) {
       mesh_id: z.string().describe('Device group ID or name'),
     },
     handler: async ({ user_id, mesh_id }) =>
-      serverResult(await client.sendCommand({ action: 'removemeshuser', meshid: meshId(mesh_id), userid: user_id }, 15_000)),
+      serverResult(await client.sendCommand({ action: 'removemeshuser', meshid: meshId(mesh_id), userid: userId(user_id) }, 15_000)),
   });
 
   define({
     name: 'mesh_add_device_user', tier: 'A', title: 'Grant device access',
-    description: 'Grant or remove a user a direct link to one device. Rights bits 0-2 are not allowed on device links.',
+    description:
+      'Grant a user a direct link to one device, or remove it. Pass full_rights: true or list named rights ' +
+      '(restrictions such as no_desktop combine with remote_control).',
     annotations: { destructiveHint: true },
-    confirmSummary: ({ user_id, node_id, remove }) => `${remove ? 'Remove' : 'Grant'} ${user_id} access to device ${node_id}`,
+    confirmSummary: ({ user_id, node_id, rights, full_rights, remove }) => remove
+      ? `Remove ${user_id}'s access to device ${node_id}`
+      : `Grant ${user_id} ${full_rights ? 'FULL rights' : `rights [${(rights ?? []).join(', ')}]`} on device ${node_id}`,
     schema: {
       node_id: z.string().describe('Device node ID or name'),
       user_id: z.string().describe('User ID or username'),
-      rights: z.number().int().describe('Rights bitmask'),
+      rights: z.array(z.enum(DEVICE_RIGHTS)).optional().describe('Named rights to grant'),
+      full_rights: z.boolean().optional().describe('Grant full control of the device (overrides rights)'),
       remove: z.boolean().optional().describe('Set true to remove the link'),
     },
-    handler: async ({ node_id, user_id, rights, remove }) =>
-      serverResult(await client.sendCommand({ action: 'adddeviceuser', nodeid: await resolveNodeId(node_id), userids: [user_id], rights, ...(remove ? { remove: true } : {}) }, 15_000)),
+    handler: async ({ node_id, user_id, rights, full_rights, remove }) => {
+      if (!remove && !full_rights && !rights?.length) return errorResult('Pass rights (a list of named rights), full_rights: true, or remove: true.');
+      const mask = remove ? 0 : full_rights ? DEVICE_FULL_RIGHTS : rightsMask(rights);
+      return serverResult(await client.sendCommand({
+        action: 'adddeviceuser', nodeid: await resolveNodeId(node_id), userids: [userId(user_id)], rights: mask, ...(remove ? { remove: true } : {}),
+      }, 15_000));
+    },
   });
 
   define({

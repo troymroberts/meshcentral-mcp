@@ -43,6 +43,8 @@ export default function register(ctx) {
 
   define({
     name: 'mesh_get_clipboard', tier: 'RF', title: 'Get clipboard',
+    sensitive: true, // clipboards often hold passwords
+    confirmSummary: ({ node_id }) => `Read the clipboard of ${node_id}`,
     description: 'Read the clipboard contents of a device (agent must be online; empty clipboard returns nothing).',
     schema: { node_id: z.string().describe('Device node ID or name (must be online)') },
     handler: async ({ node_id }) => {
@@ -59,6 +61,9 @@ export default function register(ctx) {
       }
     },
   });
+
+  const DOWNLOAD_DEFAULT_MB = 100;
+  const DOWNLOAD_MAX_MB = 2048;
 
   // ── File reads (RF) ──────────────────────────────────────────────────────
   define({
@@ -93,15 +98,26 @@ export default function register(ctx) {
 
   define({
     name: 'mesh_file_download', tier: 'RF', title: 'Download remote file',
-    description: 'Download a file from a device to the local file directory on this MCP host.',
+    description:
+      'Download a file from a device to the local file directory on this MCP host. Refuses files larger than ' +
+      `max_mb (default ${DOWNLOAD_DEFAULT_MB}) and will not replace an existing local file unless overwrite is true.`,
     schema: {
       node_id: z.string().describe('Device node ID or name (must be online)'),
       remote_path: z.string().describe('Full path of the file on the device'),
       local_path: z.string().describe('Local destination path (confined to MESH_LOCAL_FILE_ROOT)'),
+      max_mb: z.number().positive().max(DOWNLOAD_MAX_MB).optional()
+        .describe(`Largest file to accept, in MB (default ${DOWNLOAD_DEFAULT_MB}, max ${DOWNLOAD_MAX_MB})`),
+      overwrite: z.boolean().optional().describe('Replace an existing local file (default false)'),
     },
-    handler: async ({ node_id, remote_path, local_path }) => {
+    handler: async ({ node_id, remote_path, local_path, max_mb, overwrite }) => {
       const dest = resolveLocalPath(local_path, { mustExist: false });
-      const data = await withFileTunnel(node_id, (t) => t.download(remote_path));
+      if (!overwrite && fs.existsSync(dest)) return errorResult(`${dest} already exists. Pass overwrite: true to replace it, or choose another local_path.`);
+      const maxBytes = Math.floor((max_mb ?? DOWNLOAD_DEFAULT_MB) * 1024 * 1024);
+      const data = await withFileTunnel(node_id, async (t) => {
+        const entry = await t.stat(remote_path).catch(() => null);
+        if (entry?.s > maxBytes) throw new Error(`${remote_path} is ${(entry.s / 1048576).toFixed(1)} MB, over the ${maxBytes / 1048576} MB limit (max_mb).`);
+        return t.download(remote_path, { maxBytes });
+      });
       fs.writeFileSync(dest, data);
       return textResult(`Downloaded ${data.length} bytes from ${remote_path} to ${dest}`);
     },

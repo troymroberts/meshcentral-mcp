@@ -7,6 +7,9 @@ import { loadDotEnv, loadConfig } from './config.js';
 import { Policy, ConfirmationGate, setMaxOutputChars } from './safety.js';
 import { registerTools } from './register.js';
 import { AuditLog } from './audit.js';
+import { createRequire } from 'module';
+
+const { version } = createRequire(import.meta.url)('../package.json');
 
 loadDotEnv();
 
@@ -112,7 +115,7 @@ recorded in its MeshCentral event log. Point the server at a least-privilege
 MeshCentral account scoped to the devices you support.`;
 
 const server = new McpServer(
-  { name: 'meshcentral-mcp', version: '2.0.0' },
+  { name: 'meshcentral-mcp', version },
   { instructions: SERVER_INSTRUCTIONS }
 );
 
@@ -151,7 +154,11 @@ try {
   process.exit(1);
 }
 
-const { registered, terminals, desktops } = registerTools({ server, client, policy, gate, config, audit });
+const { registered, known, terminals, desktops } = registerTools({ server, client, policy, gate, config, audit });
+for (const [setting, names] of [['MESH_MCP_ENABLE_TOOLS', config.enableTools], ['MESH_MCP_DISABLE_TOOLS', config.disableTools]]) {
+  const unknown = names.filter((n) => !known.includes(n));
+  if (unknown.length) console.error(`[meshcentral-mcp] WARNING: ${setting} names unknown tool(s): ${unknown.join(', ')}`);
+}
 
 function shutdown() {
   try { terminals.closeAll(); } catch {}
