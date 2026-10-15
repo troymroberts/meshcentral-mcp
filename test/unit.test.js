@@ -187,3 +187,24 @@ test('ChatSession: join, typing, messages, unread tracking, waits and close', as
   assert.match(s.closedReason, /user closed/);
   assert.throws(() => s.send('x'), /closed/);
 });
+
+test('ChatSession re-joins the relay while waiting for the user, and gives up after joinMs', async () => {
+  const { EventEmitter } = await import('events');
+  const { ChatSession } = await import('../src/chat.js');
+  const mk = () => Object.assign(new EventEmitter(), { readyState: 1, sent: [], send(d) { this.sent.push(d); }, close() { this.readyState = 3; this.emit('close'); } });
+  const sockets = [mk()];
+  const s = new ChatSession({ id: 'c', ws: sockets[0], connect: async () => { sockets.push(mk()); return sockets.at(-1); }, nodeId: 'n', nodeName: 'PC', idleMs: 60_000, joinMs: 1_000 });
+  sockets[0].emit('close'); // relay dropped the unpaired socket after 15 s
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(sockets.length, 2);
+  assert.equal(s.isOpen, true);
+  sockets[1].emit('message', Buffer.from('c'));
+  assert.equal(s.connected, true);
+  sockets[1].emit('close');
+  assert.match(s.closedReason, /user closed/);
+
+  const late = new ChatSession({ id: 'd', ws: mk(), connect: async () => mk(), nodeId: 'n', nodeName: 'PC', idleMs: 60_000, joinMs: 0 });
+  await new Promise((r) => setTimeout(r, 5));
+  late.close('x'); // joinMs 0: a drop ends it instead of re-joining
+  assert.equal(late.isOpen, false);
+});

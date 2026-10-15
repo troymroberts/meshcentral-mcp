@@ -162,11 +162,13 @@ export default function register(ctx) {
       const existing = chats.forNode(node._id);
       const session = existing ?? await chats.open(node);
       await waitFor(session, () => session.connected, wait_seconds ?? 60, extra, `Waiting for the user at ${node.name} to join the chat`);
-      if (!session.connected && session.isOpen) {
+      if (!session.isOpen) return errorResult(`Chat with ${node.name} ended before the user joined (${session.closedReason}).`);
+      if (!session.connected) {
         return textResult(
           `Chat requested on ${node.name}, but the user has not joined yet. chat_id=${session.id}\n` +
           'Either nobody is logged in, the chat window is still opening, or the device cannot reach the MeshCentral ' +
-          'server. Keep waiting with mesh_chat_read (wait_seconds), or mesh_chat_close.'
+          'server. The chat stays ready for them for 5 minutes: keep waiting with mesh_chat_read (wait_seconds), or ' +
+          'mesh_chat_close.'
         );
       }
       return chatResult(session, existing ? `Chat with ${node.name} was already open.` : `Chat with ${node.name} is open.`);

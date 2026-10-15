@@ -7,6 +7,11 @@ import crypto from 'crypto';
 // whether the other side is typing. The page also offers WebRTC, video and file
 // transfer; those start only when both sides agree, and this side never does,
 // so everything stays on the relay WebSocket.
+//
+// MeshCentral's relay drops a connection whose partner has not arrived within
+// 15 seconds, and the chat page on the device can take longer to open. Until the
+// user joins, the session therefore re-joins the relay whenever it is dropped,
+// for up to joinMs.
 export class ChatSession {
   #ws;
   #idleTimer = null;
@@ -16,7 +21,10 @@ export class ChatSession {
   messages = []; // { from: 'user' | 'you', text, at }
   #readUpTo = 0;
 
-  constructor({ id, ws, nodeId, nodeName, idleMs, onEnd }) {
+  #connect;
+  #joinDeadline;
+
+  constructor({ id, ws, connect = null, nodeId, nodeName, idleMs, joinMs = 5 * 60_000, onEnd }) {
     this.id = id;
     this.nodeId = nodeId;
     this.nodeName = nodeName;
@@ -24,16 +32,44 @@ export class ChatSession {
     this.connected = false; // the chat page on the device has joined
     this.typing = false;
     this.closedReason = null;
-    this.#ws = ws;
     this.#idleMs = idleMs;
     this.#onEnd = onEnd;
-    ws.on('message', (data) => this.#onMessage(data));
-    ws.on('close', () => this.#end(this.connected ? 'the user closed the chat window' : 'relay closed'));
-    ws.on('error', () => {});
+    this.#connect = connect;
+    this.#joinDeadline = Date.now() + joinMs;
+    this.#attach(ws);
     this.#armIdle();
   }
 
-  get isOpen() { return this.#ws.readyState === 1 && !this.closedReason; }
+  #attach(ws) {
+    this.#ws = ws;
+    ws.on('message', (data) => { if (this.#ws === ws) this.#onMessage(data); });
+    ws.on('close', () => { if (this.#ws === ws) this.#onClose(); });
+    ws.on('error', () => {});
+  }
+
+  #onClose() {
+    if (this.closedReason) return;
+    if (this.connected) return this.#end('the user closed the chat window');
+    if (!this.#connect || Date.now() > this.#joinDeadline) return this.#end('the user did not join the chat');
+    this.#rejoin();
+  }
+
+  async #rejoin() {
+    while (!this.closedReason && Date.now() <= this.#joinDeadline) {
+      try {
+        const ws = await this.#connect();
+        if (this.closedReason) { try { ws.close(); } catch {} return; }
+        this.#attach(ws);
+        return;
+      } catch {
+        await new Promise((r) => setTimeout(r, 2_000).unref?.());
+      }
+    }
+    this.#end('the user did not join the chat');
+  }
+
+  // Open until ended; while re-joining the relay the socket may briefly be down.
+  get isOpen() { return !this.closedReason; }
 
   #armIdle() {
     clearTimeout(this.#idleTimer);
@@ -66,7 +102,7 @@ export class ChatSession {
 
   send(text) {
     if (!this.isOpen) throw new Error(`Chat ${this.id} is closed (${this.closedReason || 'unknown'}).`);
-    if (!this.connected) throw new Error('The user has not opened the chat window yet. Wait with mesh_chat_read.');
+    if (!this.connected || this.#ws.readyState !== 1) throw new Error('The user has not opened the chat window yet. Wait with mesh_chat_read.');
     this.#send({ action: 'chat', msg: text });
     this.messages.push({ from: 'you', text, at: Date.now() });
     this.#armIdle();
@@ -134,9 +170,10 @@ export class ChatManager {
   // Join the relay first, then ask the agent to open the chat page, so the
   // page finds this side waiting.
   async open(node) {
-    const ws = await this.#client.openChatRelay(node._id);
+    const connect = () => this.#client.openChatRelay(node._id);
+    const ws = await connect();
     const session = new ChatSession({
-      id: `chat_${crypto.randomBytes(5).toString('hex')}`, ws, nodeId: node._id, nodeName: node.name, idleMs: this.#idleMs,
+      id: `chat_${crypto.randomBytes(5).toString('hex')}`, ws, connect, nodeId: node._id, nodeName: node.name, idleMs: this.#idleMs,
       // Keep ended sessions for a while so the last messages can still be read.
       onEnd: (s) => setTimeout(() => { if (this.#sessions.get(s.id) === s) this.#sessions.delete(s.id); }, 10 * 60_000).unref?.(),
     });
