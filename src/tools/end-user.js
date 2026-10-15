@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { textResult, serverResult, errorResult, isServerError, deviceResult } from '../safety.js';
+import { formatChatMessage } from '../chat.js';
 
 // Reaching the person at the device: message boxes, opening a URL, chat, and
 // device share links (guest access to one device without a MeshCentral account).
@@ -137,9 +138,14 @@ export default function register(ctx) {
     await withProgress(extra, label, () => session.wait(cond, seconds * 1000));
   }
 
-  function chatResult(session, header) {
+  const formatNote = (lineBreaks) => lineBreaks
+    ? 'formatting: plain text; line breaks are shown, so a multi-line message stays one bubble'
+    : 'formatting: plain text; this server\'s chat page drops line breaks, so each line of a message is sent as its own bubble';
+
+  async function chatResult(session, header) {
     const unread = session.unread();
-    const head = `${header}\nchat_id=${session.id} device=${session.nodeName} status: ${chatStatus(session)}`;
+    const head = `${header}\nchat_id=${session.id} device=${session.nodeName} status: ${chatStatus(session)}\n` +
+      formatNote(await chats.lineBreaks());
     if (!unread.length) return textResult(`${head}\n(no new messages from the user)`);
     return deviceResult(unread.map((m) => `[${clock(m.at)}] user: ${m.text}`).join('\n'), `${head}\nNew messages from the user:`);
   }
@@ -179,7 +185,9 @@ export default function register(ctx) {
     name: 'mesh_chat_send', tier: 'W', title: 'Send chat message',
     description:
       'Send a chat message to the user. Pass wait_seconds to wait for their reply in the same call ' +
-      '(returns as soon as one arrives).',
+      '(returns as soon as one arrives). The chat shows plain text: Markdown is stripped and "-" list items become ' +
+      'bullets. If the server\'s chat page drops line breaks (see "formatting" in the result), each line is sent as ' +
+      'its own bubble, so keep lines self-contained and lists short.',
     describe: ({ chat_id, message }) => {
       let where = chat_id;
       try { where = chats.get(chat_id).nodeName; } catch {}
@@ -192,7 +200,7 @@ export default function register(ctx) {
     },
     handler: async ({ chat_id, message, wait_seconds }, extra) => {
       const session = chats.get(chat_id);
-      session.send(message);
+      session.send(message, formatChatMessage(message, await chats.lineBreaks()));
       const count = session.messages.length;
       await waitFor(session, () => session.messages.length > count, wait_seconds ?? 0, extra, `Waiting for a reply from ${session.nodeName}`);
       return chatResult(session, 'Sent.');

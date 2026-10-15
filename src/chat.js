@@ -1,5 +1,36 @@
 import crypto from 'crypto';
 
+// The MeshMessenger page shows each message as escaped text in a bubble. Stock
+// MeshCentral collapses line breaks there; a server may override
+// styles/messenger.css (meshcentral-web/public) to give the bubbles
+// white-space: pre-wrap. True when that stylesheet keeps line breaks.
+export function cssKeepsLineBreaks(css) {
+  if (!css) return false;
+  for (const [, selector, body] of css.matchAll(/([^{}]*)\{([^{}]*)\}/g)) {
+    if (/\.remoteBubble\b/.test(selector) && /white-space\s*:\s*(pre|pre-wrap|pre-line|break-spaces)\b/i.test(body)) return true;
+  }
+  return false;
+}
+
+// Turn a message into the chat bubbles to send. The page shows plain text, so
+// Markdown emphasis, code ticks and headings are removed and list markers become
+// bullets. Where line breaks are kept the message is one bubble; otherwise each
+// line becomes its own bubble so lists and paragraphs stay readable.
+export function formatChatMessage(text, lineBreaks) {
+  const lines = text.replace(/\r\n?/g, '\n').split('\n').map((line) => line
+    .replace(/\*\*(.+?)\*\*|__(.+?)__/g, '$1$2')
+    .replace(/`([^`\n]+)`/g, '$1')
+    .replace(/^\s*#{1,6}\s+/, '')
+    .replace(/^(\s*)[-*+]\s+/, '$1• ')
+    .trimEnd());
+  if (lineBreaks) {
+    const out = lines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+    return [out || text];
+  }
+  const parts = lines.map((l) => l.trim()).filter(Boolean);
+  return parts.length ? parts : [text];
+}
+
 // Text chat with the person at a device, through MeshCentral's MeshMessenger.
 //
 // The relay forwards JSON between this side and the chat page on the device:
@@ -114,11 +145,12 @@ export class ChatSession {
 
   #send(obj) { this.#ws.send(JSON.stringify(obj)); }
 
-  send(text) {
+  // Send `text`, shown to the user as the bubbles in `parts` (see formatChatMessage).
+  send(text, parts = [text]) {
     if (!this.isOpen) throw new Error(`Chat ${this.id} is closed (${this.closedReason || 'unknown'}).`);
     if (!this.connected || this.#ws.readyState !== 1) throw new Error('The user has not opened the chat window yet. Wait with mesh_chat_read.');
-    this.#send({ action: 'chat', msg: text });
-    this.messages.push({ from: 'you', text, at: Date.now() });
+    for (const msg of parts) this.#send({ action: 'chat', msg });
+    this.messages.push({ from: 'you', text: parts.join('\n'), at: Date.now() });
     this.#armIdle();
   }
 
@@ -173,6 +205,17 @@ export class ChatManager {
     const s = this.#sessions.get(id);
     if (!s) throw new Error(`No chat session '${id}'. It may have ended. Use mesh_chat_list.`);
     return s;
+  }
+
+  #lineBreaks = null; // { value, at }
+
+  // Whether the server's chat page keeps line breaks (checked every 10 minutes).
+  async lineBreaks() {
+    if (this.#lineBreaks && Date.now() - this.#lineBreaks.at < 10 * 60_000) return this.#lineBreaks.value;
+    let value = false;
+    try { value = cssKeepsLineBreaks(await this.#client.fetchText('styles/messenger.css')); } catch {}
+    this.#lineBreaks = { value, at: Date.now() };
+    return value;
   }
 
   forNode(nodeId) {

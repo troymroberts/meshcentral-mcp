@@ -221,3 +221,21 @@ test('ChatSession reports joined / message / ended events', async () => {
   s.close('done');
   assert.deepEqual(events, [['joined', null], ['message', 'hello'], ['ended', 'done']]);
 });
+
+test('cssKeepsLineBreaks: detects white-space on the remote bubble', async () => {
+  const { cssKeepsLineBreaks } = await import('../src/chat.js');
+  assert.equal(cssKeepsLineBreaks(null), false);
+  assert.equal(cssKeepsLineBreaks('.remoteBubble { color: black; }'), false);
+  assert.equal(cssKeepsLineBreaks('.localBubble { white-space: pre-wrap; }'), false);
+  assert.equal(cssKeepsLineBreaks('.remoteBubble { color: black; }\n.remoteBubble,\n.localBubble { white-space: pre-wrap; }'), true);
+  assert.equal(cssKeepsLineBreaks('.remoteBubble{white-space:pre-line}'), true);
+});
+
+test('formatChatMessage: plain text, one bubble or one per line', async () => {
+  const { formatChatMessage } = await import('../src/chat.js');
+  const md = 'Checked the **System** log:\n\n- no `errors`\n- one warning\n\n\n\nDone.';
+  assert.deepEqual(formatChatMessage(md, true), ['Checked the System log:\n\n• no errors\n• one warning\n\nDone.']);
+  assert.deepEqual(formatChatMessage(md, false), ['Checked the System log:', '• no errors', '• one warning', 'Done.']);
+  assert.deepEqual(formatChatMessage('hello', false), ['hello']);
+  assert.deepEqual(formatChatMessage('a\r\nb', false), ['a', 'b']);
+});

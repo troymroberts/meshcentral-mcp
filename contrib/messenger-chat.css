@@ -1,0 +1,202 @@
+
+/* ── meshcentral-mcp chat restyle ─────────────────────────────────────────
+   Appended to MeshCentral's stock styles/messenger.css by
+   scripts/install-chat-css.sh and served from meshcentral-web/public, which
+   overrides the built-in file. The page sets most layout with inline styles,
+   hence !important. white-space on .remoteBubble is what meshcentral-mcp
+   checks for: with it, multi-line chat messages are sent as one bubble. */
+
+:root {
+    --chat-bg: #f3f5f8;
+    --chat-bar: #003366;
+    --chat-bar-text: #f2f5f9;
+    --chat-them-bg: #ffffff;
+    --chat-them-text: #1c2430;
+    --chat-them-border: #dde3ea;
+    --chat-me-bg: #2563eb;
+    --chat-me-text: #ffffff;
+    --chat-notice: #6b7685;
+    --chat-input-bg: #ffffff;
+    --chat-input-border: #c9d2dc;
+    --chat-focus: #2563eb;
+}
+
+@media (prefers-color-scheme: dark) {
+    :root {
+        --chat-bg: #15191f;
+        --chat-bar: #0c1f36;
+        --chat-them-bg: #232a33;
+        --chat-them-text: #e6ebf1;
+        --chat-them-border: #313a46;
+        --chat-me-bg: #3b74f0;
+        --chat-notice: #8b96a5;
+        --chat-input-bg: #1c2229;
+        --chat-input-border: #3a4450;
+        --chat-focus: #6b9bff;
+    }
+}
+
+body {
+    font-family: "Segoe UI", system-ui, -apple-system, Roboto, Arial, sans-serif !important;
+    background-color: var(--chat-bg);
+    margin: 0;
+}
+
+#xtop {
+    background-color: var(--chat-bar) !important;
+    color: var(--chat-bar-text) !important;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.25) !important;
+}
+
+    #xtop > div[style*="position:absolute"] { background-color: var(--chat-bar) !important; }
+    #xtop > div:last-child { font-size: 17px !important; padding-top: 10px !important; padding-left: 8px !important; }
+
+#xmiddle {
+    font-size: 15px !important;
+    bottom: 56px !important;
+    background-color: var(--chat-bg);
+}
+
+#xmsg { padding: 14px 14px 6px !important; }
+
+.remoteBubble,
+.localBubble {
+    max-width: min(75%, 640px);
+    padding: 8px 12px;
+    margin-bottom: 8px;
+    border-radius: 14px;
+    line-height: 1.45;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+}
+
+/* Messages from the other side (on the device: the support technician). */
+.remoteBubble {
+    background-color: var(--chat-them-bg);
+    color: var(--chat-them-text);
+    border: 1px solid var(--chat-them-border);
+    border-bottom-left-radius: 4px;
+    margin-right: 0;
+}
+
+/* Messages typed in this window. */
+.localBubble {
+    background-color: var(--chat-me-bg);
+    color: var(--chat-me-text);
+    border-bottom-right-radius: 4px;
+    margin-left: 0;
+}
+
+/* Status lines ("Waiting for other user...", "Connected.") as centred notices. */
+#xmsg div[style*="color:gray"] {
+    float: none !important;
+    text-align: center;
+    font-size: 12px;
+    color: var(--chat-notice) !important;
+    margin: 4px 0 10px !important;
+}
+
+#typingIndicator { margin-left: 14px !important; opacity: 0.7; }
+
+#xbottom {
+    height: 56px !important;
+    background-color: var(--chat-bar) !important;
+    box-sizing: border-box;
+    padding: 8px 10px;
+}
+
+    #xbottom table { border-collapse: separate; border-spacing: 8px 0; margin: 0 -8px; }
+
+#xouttext {
+    height: 40px;
+    padding: 0 14px;
+    font-size: 15px !important;
+    font-family: inherit;
+    color: var(--chat-them-text);
+    background-color: var(--chat-input-bg);
+    border: 1px solid var(--chat-input-border);
+    border-radius: 20px;
+    outline: none;
+}
+
+    #xouttext:focus { border-color: var(--chat-focus); box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.3); }
+
+#sendButton,
+#clearButton {
+    height: 40px;
+    padding: 0 18px;
+    font-size: 15px !important;
+    font-family: inherit;
+    border-radius: 20px;
+    border: 1px solid transparent;
+    cursor: pointer;
+}
+
+#sendButton { background-color: var(--chat-me-bg); color: #fff; font-weight: 600; }
+    #sendButton:hover { filter: brightness(1.1); }
+
+#clearButton { background-color: transparent; color: var(--chat-bar-text); border-color: rgba(255, 255, 255, 0.35); }
+    #clearButton:hover { background-color: rgba(255, 255, 255, 0.1); }
+
+/* ── Layout and polish ──────────────────────────────────────────────────── */
+
+/* Keep the conversation in a readable column on wide windows. */
+#xmsg { max-width: 860px; margin: 0 auto; box-sizing: border-box; }
+
+/* Runs of messages from the same side: tighter spacing, and only the last
+   bubble of a run keeps the squared "tail" corner. Each message is wrapped in
+   <div style="clear:both">. Browsers without :has() keep the plain look. */
+#xmsg > div:has(> .remoteBubble):has(+ div > .remoteBubble) > .remoteBubble {
+    margin-bottom: 2px;
+    border-bottom-left-radius: 14px;
+}
+#xmsg > div:has(> .remoteBubble) + div > .remoteBubble { border-top-left-radius: 4px; }
+
+#xmsg > div:has(> .localBubble):has(+ div > .localBubble) > .localBubble {
+    margin-bottom: 2px;
+    border-bottom-right-radius: 14px;
+}
+#xmsg > div:has(> .localBubble) + div > .localBubble { border-top-right-radius: 4px; }
+
+/* New messages fade in. */
+@keyframes chatIn {
+    from { opacity: 0; transform: translateY(6px); }
+    to { opacity: 1; transform: none; }
+}
+.remoteBubble, .localBubble { animation: chatIn 0.18s ease-out; }
+@media (prefers-reduced-motion: reduce) {
+    .remoteBubble, .localBubble { animation: none; }
+}
+
+::selection { background-color: rgba(37, 99, 235, 0.25); }
+
+/* Typing indicator as a small "them" bubble. */
+#typingIndicator {
+    background-color: var(--chat-them-bg);
+    border: 1px solid var(--chat-them-border);
+    border-radius: 14px;
+    border-bottom-left-radius: 4px;
+    padding: 2px 10px;
+    width: fit-content;
+    opacity: 1 !important;
+}
+#typingIndicator img { display: block; height: 20px; }
+
+/* Thin scrollbar for the message area. */
+#xmsgparent { scrollbar-width: thin; scrollbar-color: var(--chat-input-border) transparent; }
+#xmsgparent::-webkit-scrollbar { width: 8px; }
+#xmsgparent::-webkit-scrollbar-thumb { background-color: var(--chat-input-border); border-radius: 4px; }
+
+/* Toolbar buttons (save, notifications, file, camera). */
+.topButton { border-radius: 6px; transition: background-color 0.15s; }
+.topButton:hover { background-color: rgba(255, 255, 255, 0.18); }
+
+/* Visible focus for keyboard users. */
+#sendButton:focus-visible, #clearButton:focus-visible, .topButton:focus-visible {
+    outline: 2px solid var(--chat-focus);
+    outline-offset: 2px;
+}
+
+/* File-transfer bubbles: match the new bubble shape. */
+#xmsg [id^="FILEUP-"].remoteBubble, #xmsg [id^="FILEUP-"].localBubble { border-radius: 14px; }

@@ -1,5 +1,6 @@
 import WebSocket from 'ws';
 import crypto from 'crypto';
+import http from 'http';
 import https from 'https';
 
 const PING_INTERVAL_MS = 30_000;
@@ -75,6 +76,27 @@ export class MeshCentralClient {
       ws.once('error', (err) => { clearTimeout(timer); reject(new Error(`Chat relay error: ${err.message}`)); });
     });
     return ws;
+  }
+
+  // GET a static file from the web server (e.g. 'styles/messenger.css'),
+  // relative to the server URL. Resolves to the body text, or null on a non-200.
+  fetchText(file, timeoutMs = 10_000) {
+    const base = new URL(this.#config.serverUrl);
+    if (!base.pathname.endsWith('/')) base.pathname += '/';
+    const url = new URL(file, base);
+    const mod = url.protocol === 'https:' ? https : http;
+    const opts = url.protocol === 'https:' ? { rejectUnauthorized: this.#config.rejectUnauthorized } : {};
+    return new Promise((resolve, reject) => {
+      const req = mod.get(url, opts, (res) => {
+        if (res.statusCode !== 200) { res.resume(); return resolve(null); }
+        let body = '';
+        res.setEncoding('utf8');
+        res.on('data', (d) => { body += d; if (body.length > 1_000_000) req.destroy(new Error('Response too large.')); });
+        res.on('end', () => resolve(body));
+      });
+      req.setTimeout(timeoutMs, () => req.destroy(new Error('Request timed out.')));
+      req.on('error', reject);
+    });
   }
 
   #wsOptions() {
