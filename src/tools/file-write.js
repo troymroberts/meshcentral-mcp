@@ -2,6 +2,7 @@ import fs from 'fs';
 import { z } from 'zod';
 import { resolveLocalPath } from '../local-path.js';
 import { splitRemotePath, joinRemotePath } from '../file-tunnel.js';
+import { agentPathRisk } from '../agent-guard.js';
 import { textResult, errorResult } from '../safety.js';
 
 // WF — remote file write
@@ -17,6 +18,7 @@ export default function register(ctx) {
     description: 'Write text or base64 content to a file on a device.',
     annotations: { destructiveHint: true },
     confirmSummary: ({ node_id, file_path }) => `Write file ${file_path} on ${node_id}`,
+    agentRisk: async ({ file_path }) => agentPathRisk(file_path),
     schema: {
       node_id: z.string().describe('Device node ID or name (must be online)'),
       file_path: z.string().describe('Full destination path on the device'),
@@ -36,6 +38,8 @@ export default function register(ctx) {
     description: 'Upload a local file (from MESH_LOCAL_FILE_ROOT) to a device.',
     annotations: { destructiveHint: true },
     confirmSummary: ({ local_path, node_id, remote_dir }) => `Upload ${local_path} to ${remote_dir} on ${node_id}`,
+    agentRisk: async ({ local_path, remote_dir, remote_name }) =>
+      agentPathRisk(remote_dir, remote_name ?? local_path.split(/[\\/]/).pop()),
     schema: {
       node_id: z.string().describe('Device node ID or name (must be online)'),
       local_path: z.string().describe('Local file to upload (confined to MESH_LOCAL_FILE_ROOT)'),
@@ -57,6 +61,7 @@ export default function register(ctx) {
     annotations: { destructiveHint: true },
     confirmSummary: ({ node_id, path, names, recursive }) =>
       `Delete ${JSON.stringify(names)} from ${path} on ${node_id}${recursive ? ' (recursive)' : ''}`,
+    agentRisk: async ({ path, names }) => agentPathRisk(path, names),
     schema: {
       node_id: z.string().describe('Device node ID or name (must be online)'),
       path: z.string().describe('Parent directory containing the files'),

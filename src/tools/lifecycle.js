@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { isAgentProcess, isAgentService } from '../agent-guard.js';
-import { textResult, serverResult, errorResult, deviceResult } from '../safety.js';
+import { textResult, serverResult, errorResult, deviceResult, psQuote } from '../safety.js';
 
 // P — disruptive / agent lifecycle
 export default function register(ctx) {
@@ -89,11 +89,11 @@ export default function register(ctx) {
       const node = await requireNode(node_id);
       let out;
       if (isWindowsNode(node)) {
-        const name = service.replace(/'/g, "''");
+        const name = psQuote(service);
         const verb = { start: 'Start-Service', stop: 'Stop-Service', restart: 'Restart-Service' }[action];
         out = await runShell(node, [
-          `$s = Get-Service -Name '${name}' -ErrorAction SilentlyContinue`,
-          `if (-not $s) { $s = Get-Service -DisplayName '${name}' -ErrorAction SilentlyContinue }`,
+          `$s = Get-Service -Name ${name} -ErrorAction SilentlyContinue`,
+          `if (-not $s) { $s = Get-Service -DisplayName ${name} -ErrorAction SilentlyContinue }`,
           `if (-not $s) { 'ERROR: no such service'; exit }`,
           `if ("$($s.Name) $($s.DisplayName)" -match 'mesh ?agent') { 'REFUSED: Mesh Agent service'; exit }`,
           `try { ${verb} -InputObject $s -ErrorAction Stop } catch { "ERROR: $($_.Exception.Message)" }`,

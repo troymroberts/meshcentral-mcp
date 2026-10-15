@@ -1,5 +1,30 @@
 import { z } from 'zod';
-import { serverResult } from '../safety.js';
+import { serverResult, errorResult } from '../safety.js';
+
+// MeshCentral device-group rights (MESHRIGHT_* in meshcentral's meshuser.js).
+export const MESH_RIGHTS = {
+  edit_group: 1,
+  manage_users: 2,
+  manage_devices: 4,
+  remote_control: 8,
+  agent_console: 16,
+  server_files: 32,
+  wake_devices: 64,
+  edit_notes: 128,
+  remote_view_only: 256,
+  no_terminal: 512,
+  no_files: 1024,
+  no_amt: 2048,
+  limited_input: 4096,
+  limit_events: 8192,
+  chat_notify: 16384,
+  uninstall: 32768,
+  no_desktop: 65536,
+  remote_commands: 131072,
+  reset_power_off: 262144,
+};
+export const FULL_RIGHTS = 0xFFFFFFFF;
+export const rightsMask = (names) => names.reduce((m, n) => m | MESH_RIGHTS[n], 0) >>> 0;
 
 // A — administration
 export default function register(ctx) {
@@ -40,19 +65,23 @@ export default function register(ctx) {
   define({
     name: 'mesh_add_user_to_group', tier: 'A', title: 'Grant group access',
     description:
-      'Grant a user rights to a device group. Rights bitmask: 1 editGroup, 2 manageUsers, 4 manageComputers, ' +
-      '8 remoteControl, 16 agentConsole, 32 remoteCommands, 64 resetPowerOff, 128 viewOnly, 256 noTerminal, ' +
-      '512 noDesktop, 1024 noFiles, 2048 noAMT, 4096 limitedInput, 8192 noClipboard, 16384 chat, 32768 wol, ' +
-      '65536 noRemoteCmd. 4294967295 = full.',
+      'Grant a user rights to a device group. Pass full_rights: true for full control, or list named rights. ' +
+      'Restrictions (no_*, remote_view_only, limited_input, limit_events) take rights away: combine them with ' +
+      'remote_control to grant restricted remote access.',
     annotations: { destructiveHint: true },
-    confirmSummary: ({ user_id, mesh_id, rights }) => `Grant ${user_id} rights ${rights} on group ${mesh_id}`,
+    confirmSummary: ({ user_id, mesh_id, rights, full_rights }) =>
+      `Grant ${user_id} ${full_rights ? 'FULL rights' : `rights [${(rights ?? []).join(', ')}]`} on group ${mesh_id}`,
     schema: {
       user_id: z.string().describe('User ID or username'),
       mesh_id: z.string().describe('Device group ID or name'),
-      rights: z.number().int().describe('Rights bitmask (4294967295 = full)'),
+      rights: z.array(z.enum(Object.keys(MESH_RIGHTS))).optional().describe('Named rights to grant'),
+      full_rights: z.boolean().optional().describe('Grant full control of the group (overrides rights)'),
     },
-    handler: async ({ user_id, mesh_id, rights }) =>
-      serverResult(await client.sendCommand({ action: 'addmeshuser', meshid: meshId(mesh_id), userids: [user_id], meshadmin: rights }, 15_000)),
+    handler: async ({ user_id, mesh_id, rights, full_rights }) => {
+      if (!full_rights && !rights?.length) return errorResult('Pass rights (a list of named rights) or full_rights: true.');
+      const meshadmin = full_rights ? FULL_RIGHTS : rightsMask(rights);
+      return serverResult(await client.sendCommand({ action: 'addmeshuser', meshid: meshId(mesh_id), userids: [user_id], meshadmin }, 15_000));
+    },
   });
 
   define({

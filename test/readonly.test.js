@@ -106,3 +106,23 @@ test('ConfirmationGate: an unanswered prompt does not degrade to token mode', as
   assert.equal(r.isError, true);
   assert.doesNotMatch(r.content[0].text, /confirm_token/);
 });
+
+test('PowerShell: typographic quotes and dashes are rejected (PowerShell treats them as quotes / "-")', () => {
+  assert.equal(ps("Get-ChildItem 'x\u2018; Remove-Item -Recurse C:\\Data; \u2018'"), false);
+  assert.equal(ps('Get-ChildItem \u201Cx\u201D'), false);
+  assert.equal(ps('Get-ChildItem \u2013Recurse C:\\'), false);
+  assert.equal(ps("Get-ChildItem 'x'"), true);
+});
+
+test('psQuote doubles ASCII and typographic single quotes', async () => {
+  const { psQuote } = await import('../src/safety.js');
+  assert.equal(psQuote("a'b"), "'a''b'");
+  assert.equal(psQuote('x\u2018; Remove-Item C:\; \u2019'), "'x\u2018\u2018; Remove-Item C:\; \u2019\u2019'");
+});
+
+test('ConfirmationGate: mode off still prompts when forcePrompt is set (agent disruption)', async () => {
+  const gate = new ConfirmationGate({ mode: 'off' });
+  assert.equal(await gate.check('mesh_run_command', 'x', {}, 'X'), null);
+  const r = await gate.check('mesh_run_command', 'x', {}, 'X', { forcePrompt: true });
+  assert.match(r.content[0].text, /CONFIRMATION REQUIRED/);
+});

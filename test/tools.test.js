@@ -387,3 +387,37 @@ test('command tools take purpose first; it leads the approval prompt and heads t
   assert.match(auto.text, /^Purpose: Check the machine name\nApproval: auto-approved \(read-only\)\n.*hostname/);
   cleanup();
 });
+
+// ── tiering, agent file guard, named rights ─────────────────────────────
+
+test('risky file and access tools are confirmable tiers; consent is a separate admin tool', async () => {
+  const { server, cleanup } = setup({ profile: 'admin' });
+  const tier = (n) => server.tools[n].meta.description.match(/^\[tier (\w+)\]/)[1];
+  for (const n of ['mesh_file_rename', 'mesh_file_copy', 'mesh_file_move']) assert.equal(tier(n), 'WF', n);
+  for (const n of ['mesh_change_device_group', 'mesh_create_invite_link', 'mesh_set_device_consent']) assert.equal(tier(n), 'A', n);
+  assert.equal(tier('mesh_file_mkdir'), 'W');
+  assert.ok(!('consent' in server.tools.mesh_edit_device.meta.inputSchema));
+  cleanup();
+});
+
+test('file write tools refuse Mesh Agent files', async () => {
+  const { call, cleanup } = setup();
+  const dir = 'C:\\Program Files\\Mesh Agent';
+  for (const [name, args] of [
+    ['mesh_file_write', { node_id: 'web01', file_path: '/usr/local/mesh_services/meshagent/meshagent.msh', content: 'x' }],
+    ['mesh_file_delete', { node_id: 'Prudecon-File', path: dir, names: ['MeshAgent.exe'] }],
+    ['mesh_file_move', { node_id: 'Prudecon-File', source_dir: dir, dest_dir: 'C:\\Temp', names: ['MeshAgent.db'] }],
+    ['mesh_file_rename', { node_id: 'Prudecon-File', path: 'C:\\Temp', old_name: 'a', new_name: 'meshagent.msh' }],
+  ]) assert.match((await call(name, args)).text, /BLOCKED/, name);
+  cleanup();
+});
+
+test('mesh_add_user_to_group takes named rights and sends the MeshCentral bitmask', async () => {
+  const { client, call, cleanup } = setup({ profile: 'admin' });
+  await call('mesh_add_user_to_group', { user_id: 'user//bob', mesh_id: 'mesh//g1', rights: ['remote_control', 'no_desktop', 'edit_notes'] });
+  await call('mesh_add_user_to_group', { user_id: 'user//bob', mesh_id: 'mesh//g1', full_rights: true });
+  const sent = client.sent.filter((c) => c.action === 'addmeshuser').map((c) => c.meshadmin);
+  assert.deepEqual(sent, [8 | 65536 | 128, 4294967295]);
+  assert.match((await call('mesh_add_user_to_group', { user_id: 'user//bob', mesh_id: 'mesh//g1' })).text, /full_rights/);
+  cleanup();
+});

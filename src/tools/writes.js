@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { joinRemotePath } from '../file-tunnel.js';
+import { agentPathRisk } from '../agent-guard.js';
 import { textResult, serverResult, errorResult } from '../safety.js';
 
 // W — low-impact writes
@@ -60,13 +61,12 @@ export default function register(ctx) {
 
   define({
     name: 'mesh_edit_device', tier: 'W', title: 'Edit device',
-    description: "Edit a device's name, host, tags, consent flags, or RDP/SSH ports.",
+    description: "Edit a device's name, host, tags, or RDP/SSH ports. (Consent flags: mesh_set_device_consent.)",
     schema: {
       node_id: z.string().describe('Device node ID or name'),
       name: z.string().optional().describe('New display name'),
       host: z.string().optional().describe('New hostname/IP'),
       tags: z.array(z.string()).optional().describe('Tags to set'),
-      consent: z.number().int().optional().describe('Consent flags bitmask'),
       rdpport: z.number().int().optional().describe('RDP port'),
       sshport: z.number().int().optional().describe('SSH port'),
     },
@@ -75,6 +75,23 @@ export default function register(ctx) {
       if (Array.isArray(cmd.tags)) cmd.tags = JSON.stringify(cmd.tags);
       return serverResult(await client.sendCommand(cmd, 15_000));
     },
+  });
+
+  define({
+    name: 'mesh_set_device_consent', tier: 'A', title: 'Set device consent',
+    description:
+      "Set a device's user-consent flags: whether the person at the device is notified of, or must approve, " +
+      'desktop, terminal and file sessions. Lowering them removes a privacy control. ' +
+      'Bits: 1 desktop notify, 2 terminal notify, 4 files notify, 8 desktop prompt, 16 terminal prompt, ' +
+      '32 files prompt, 64 connection toolbar. 0 = no notification or prompt.',
+    annotations: { destructiveHint: true },
+    confirmSummary: ({ node_id, consent }) => `Set consent flags on ${node_id} to ${consent}`,
+    schema: {
+      node_id: z.string().describe('Device node ID or name'),
+      consent: z.number().int().min(0).describe('Consent flags bitmask (see description)'),
+    },
+    handler: async ({ node_id, consent }) =>
+      serverResult(await client.sendCommand({ action: 'changedevice', nodeid: await resolveNodeId(node_id), consent }, 15_000)),
   });
 
   define({
@@ -109,8 +126,10 @@ export default function register(ctx) {
   });
 
   define({
-    name: 'mesh_change_device_group', tier: 'W', title: 'Move device to group',
-    description: 'Move a device to a different device group.',
+    name: 'mesh_change_device_group', tier: 'A', title: 'Move device to group',
+    description: 'Move a device to a different device group. This changes which users can access it.',
+    annotations: { destructiveHint: true },
+    confirmSummary: ({ node_id, meshid }) => `Move ${node_id} to group ${meshid} (changes who can access it)`,
     schema: {
       node_id: z.string().describe('Device node ID or name'),
       meshid: z.string().describe('Target group ID or name'),
@@ -162,8 +181,10 @@ export default function register(ctx) {
   });
 
   define({
-    name: 'mesh_create_invite_link', tier: 'W', title: 'Create invite link',
-    description: 'Create an agent-installation invite link for a device group.',
+    name: 'mesh_create_invite_link', tier: 'A', title: 'Create invite link',
+    description: 'Create an agent-installation invite link for a device group. Anyone with the link can enrol a device into the group until it expires.',
+    annotations: { destructiveHint: true },
+    confirmSummary: ({ mesh_id, expire_hours }) => `Create an invite link for group ${mesh_id}, valid ${expire_hours ?? 8}h`,
     schema: {
       mesh_id: z.string().describe('Device group ID or name'),
       expire_hours: z.number().int().positive().optional().describe('Expiry in hours (default 8)'),
@@ -173,7 +194,8 @@ export default function register(ctx) {
       serverResult(await client.sendCommand({ action: 'createInviteLink', meshid: meshId(mesh_id), expire: expire_hours ?? 8, flags: flags ?? 0 }, 15_000)),
   });
 
-  // ── File metadata writes (W) ─────────────────────────────────────────────
+  // ── Remote file operations ─────────────────────────────────────────────────
+  // mkdir is W; rename/copy/move can overwrite or displace files, so they are WF.
   // These agent file ops are not acknowledged, so each verifies via stat()/list().
   define({
     name: 'mesh_file_mkdir', tier: 'W', title: 'Create remote directory',
@@ -192,8 +214,11 @@ export default function register(ctx) {
   });
 
   define({
-    name: 'mesh_file_rename', tier: 'W', title: 'Rename remote file',
+    name: 'mesh_file_rename', tier: 'WF', title: 'Rename remote file',
     description: 'Rename a file or folder on a device (within its directory).',
+    annotations: { destructiveHint: true },
+    confirmSummary: ({ node_id, path, old_name, new_name }) => `Rename ${old_name} to ${new_name} in ${path} on ${node_id}`,
+    agentRisk: async ({ path, old_name, new_name }) => agentPathRisk(path, old_name, new_name),
     schema: {
       node_id: z.string().describe('Device node ID or name (must be online)'),
       path: z.string().describe('Parent directory'),
@@ -210,8 +235,12 @@ export default function register(ctx) {
   });
 
   define({
-    name: 'mesh_file_copy', tier: 'W', title: 'Copy remote files',
-    description: 'Copy files between directories on a device.',
+    name: 'mesh_file_copy', tier: 'WF', title: 'Copy remote files',
+    description: 'Copy files between directories on a device (existing files in dest_dir may be overwritten).',
+    annotations: { destructiveHint: true },
+    confirmSummary: ({ node_id, source_dir, dest_dir, names }) =>
+      `Copy ${JSON.stringify(names)} from ${source_dir} to ${dest_dir} on ${node_id}`,
+    agentRisk: async ({ source_dir, dest_dir, names }) => agentPathRisk(source_dir, dest_dir, names),
     schema: {
       node_id: z.string().describe('Device node ID or name (must be online)'),
       source_dir: z.string().describe('Source directory'),
@@ -227,8 +256,12 @@ export default function register(ctx) {
   });
 
   define({
-    name: 'mesh_file_move', tier: 'W', title: 'Move remote files',
-    description: 'Move files between directories on a device.',
+    name: 'mesh_file_move', tier: 'WF', title: 'Move remote files',
+    description: 'Move files between directories on a device (existing files in dest_dir may be overwritten).',
+    annotations: { destructiveHint: true },
+    confirmSummary: ({ node_id, source_dir, dest_dir, names }) =>
+      `Move ${JSON.stringify(names)} from ${source_dir} to ${dest_dir} on ${node_id}`,
+    agentRisk: async ({ source_dir, dest_dir, names }) => agentPathRisk(source_dir, dest_dir, names),
     schema: {
       node_id: z.string().describe('Device node ID or name (must be online)'),
       source_dir: z.string().describe('Source directory'),

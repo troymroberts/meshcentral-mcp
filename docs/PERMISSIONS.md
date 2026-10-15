@@ -69,7 +69,7 @@ MESH_TOKEN=~t:xxxxxxxxxxxxxxxx,xxxxxxxxxxxxxxxxxxxx
 Set the profile with `MESH_MCP_PROFILE`. Adjust it without switching profiles using:
 
 - `MESH_MCP_ENABLE_TOOLS` / `MESH_MCP_DISABLE_TOOLS` — comma-separated tool names to force on/off
-- `MESH_MCP_CONFIRM_TIERS` — comma-separated tiers that require confirmation (overrides the profile default)
+- `MESH_MCP_CONFIRM_TIERS` — comma-separated tiers that require confirmation (default X, WF, P, A in every profile — including tools switched on with `MESH_MCP_ENABLE_TOOLS` outside their profile)
 - `MESH_MCP_CONFIRM_MODE` — `auto` (elicitation, else token), `elicit`, `token`, or `off`
 
 Confirmation prefers MCP **elicitation** (a prompt to the human). When the client

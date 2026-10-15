@@ -7,7 +7,7 @@ import path from 'path';
 import { parseEnvFile, resolveCredentials, loadConfig } from '../src/config.js';
 import {
   sanitizeText, sanitizeDeep, truncate, isServerError, serverResult, errorResult,
-  Policy, PROFILES, ConfirmationGate, argsDigest,
+  Policy, PROFILES, TIERS, ConfirmationGate, argsDigest,
 } from '../src/safety.js';
 import { splitRemotePath, joinRemotePath, isWindowsPath } from '../src/file-tunnel.js';
 import { resolveLocalPath, _resetLocalFileRoot } from '../src/local-path.js';
@@ -76,15 +76,18 @@ test('Policy gates by profile tier and overrides', () => {
   assert.throws(() => new Policy({ profile: 'nope' }), /Unknown MESH_MCP_PROFILE/);
 });
 
-test('Policy confirm tiers follow the profile', () => {
-  assert.equal(new Policy({ profile: 'support' }).needsConfirm('X'), true);
-  assert.equal(new Policy({ profile: 'support' }).needsConfirm('P'), false);
+test('Policy confirms X/WF/P/A in every profile, also for tools enabled outside it', () => {
+  for (const profile of Object.keys(PROFILES)) {
+    const p = new Policy({ profile, enableTools: ['mesh_run_command'] });
+    for (const t of ['X', 'WF', 'P', 'A']) assert.equal(p.needsConfirm(t), true, `${profile} ${t}`);
+    for (const t of ['R', 'RF', 'W']) assert.equal(p.needsConfirm(t), false, `${profile} ${t}`);
+  }
   assert.equal(new Policy({ profile: 'admin', confirmTiers: [] }).needsConfirm('P'), false);
 });
 
 test('every profile tier set is a subset of defined tiers', () => {
   for (const p of Object.values(PROFILES)) {
-    for (const c of p.confirm) assert.ok(p.tiers.includes(c), `${c} confirmed but not in tiers`);
+    for (const t of p.tiers) assert.ok(t in TIERS, `${t} is not a defined tier`);
   }
 });
 

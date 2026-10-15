@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { deviceResult, errorResult, trimLines } from '../safety.js';
+import { deviceResult, errorResult, trimLines, psQuote } from '../safety.js';
 
 // RF — built-in diagnostics.
 //
@@ -11,7 +11,6 @@ export default function register(ctx) {
   const { define, requireNode, isWindowsNode, runShell, withProgress } = ctx;
 
   // ── quoting helpers ───────────────────────────────────────────────────────
-  const psQuote = (s) => `'${String(s).replace(/'/g, "''")}'`;
   const shQuote = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
   const SAFE_NAME = /^[\w .\/@$:()-]{1,200}$/; // log, provider, unit and service names
 

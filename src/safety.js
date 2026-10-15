@@ -80,6 +80,12 @@ export function deviceResult(value, header = '') {
   return { content: [{ type: 'text', text }] };
 }
 
+// Quote a value as a PowerShell single-quoted string. PowerShell also treats the
+// typographic single quotes ‘ ’ ‚ ‛ as quote characters, so each is doubled too.
+export function psQuote(s) {
+  return `'${String(s).replace(/['\u2018-\u201B]/g, (q) => q + q)}'`;
+}
+
 export function errorResult(message) {
   return { content: [{ type: 'text', text: `ERROR: ${sanitizeText(String(message))}` }], isError: true };
 }
@@ -107,11 +113,16 @@ export const TIERS = {
 };
 
 export const PROFILES = {
-  readonly: { tiers: ['R'], confirm: [] },
-  support: { tiers: ['R', 'RF', 'W', 'X'], confirm: ['X'] },
-  operations: { tiers: ['R', 'RF', 'W', 'X', 'WF', 'P'], confirm: ['X', 'WF', 'P'] },
-  admin: { tiers: ['R', 'RF', 'W', 'X', 'WF', 'P', 'A'], confirm: ['X', 'WF', 'P', 'A'] },
+  readonly: { tiers: ['R'] },
+  support: { tiers: ['R', 'RF', 'W', 'X'] },
+  operations: { tiers: ['R', 'RF', 'W', 'X', 'WF', 'P'] },
+  admin: { tiers: ['R', 'RF', 'W', 'X', 'WF', 'P', 'A'] },
 };
+
+// Tiers confirmed unless MESH_MCP_CONFIRM_TIERS says otherwise. Applied to every
+// profile, so a tool switched on with MESH_MCP_ENABLE_TOOLS outside its profile
+// still asks.
+const DEFAULT_CONFIRM = ['X', 'WF', 'P', 'A'];
 
 export class Policy {
   constructor({ profile = 'readonly', enableTools = [], disableTools = [], confirmTiers = null, autoApproveReadOnly = true }) {
@@ -119,7 +130,7 @@ export class Policy {
     if (!p) throw new Error(`Unknown MESH_MCP_PROFILE '${profile}'. Valid: ${Object.keys(PROFILES).join(', ')}`);
     this.profile = profile;
     this.tiers = new Set(p.tiers);
-    this.confirm = new Set(confirmTiers ?? p.confirm);
+    this.confirm = new Set(confirmTiers ?? DEFAULT_CONFIRM);
     this.enable = new Set(enableTools);
     this.disable = new Set(disableTools);
     // Skip confirmation for commands the read-only classifier (readonly.js) recognises.
@@ -279,7 +290,8 @@ export class ConfirmationGate {
   //                  for actions that could cut off remote access)
   async decide(toolName, summary, args, tier = 'X', opts = {}) {
     const { nodeIds = [], device = null, forcePrompt = false } = opts;
-    if (this.#mode === 'off') return { block: null, via: 'off' };
+    // Agent disruption prompts even with confirmation off: it can cut off remote access.
+    if (this.#mode === 'off' && !forcePrompt) return { block: null, via: 'off' };
     if (!forcePrompt && this.isGranted(toolName, tier, nodeIds)) return { block: null, via: 'grant' };
     const offerGrants = this.#sessionGrants && !forcePrompt;
 

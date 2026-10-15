@@ -460,8 +460,14 @@ function psValidate(tokens) {
   return statements(null) && i === tokens.length;
 }
 
+// PowerShell treats typographic quotes (‘ ’ ‚ ‛ “ ” „) as quotes and en/em
+// dashes as '-'. The tokenizer only knows the ASCII forms, so a curly quote could
+// hide a second statement inside what looks like one string: refuse them.
+const PS_TYPOGRAPHIC = /[\u2013-\u2015\u2018-\u201E]/;
+
 export function isReadOnlyPowerShell(command) {
   if (typeof command !== 'string' || !command.trim()) return false;
+  if (PS_TYPOGRAPHIC.test(command)) return false;
   if (/[\r\n]/.test(command)) return false;
   const text = command.replace(PS_SAFE_REDIRECTS, ' ');
   const tokens = psTokenize(text);

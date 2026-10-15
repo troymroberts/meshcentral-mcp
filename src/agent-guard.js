@@ -34,6 +34,13 @@ export function agentRisk(text) {
   return 'it appears to stop, restart, kill, disable, reconfigure or modify the Mesh Agent';
 }
 
+// Reason string when a file operation touches the agent's files (its install
+// directory, binary, .msh settings or database), else null.
+export function agentPathRisk(...paths) {
+  const hit = paths.flat().filter((p) => typeof p === 'string').find((p) => AGENT_RE.test(p));
+  return hit ? `it writes, moves or deletes Mesh Agent files (${hit})` : null;
+}
+
 // True for a process name that is the agent itself.
 export function isAgentProcess(name) {
   return typeof name === 'string' && /^mesh[\s_-]?agent(\.exe)?$/i.test(name.trim());
