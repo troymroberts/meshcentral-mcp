@@ -21,6 +21,35 @@ A Model Context Protocol (MCP) server that lets AI assistants operate your MeshC
 - **Output sanitization** and device-output fencing to blunt prompt-injection from managed devices
 - WebSocket health check, automatic reconnect with backoff, and path-prefix-aware URLs
 
+## Install as a Claude Code plugin
+
+The quickest way to use it from Claude Code on a workstation (Claude Code 2.1.275 or later; needs Node.js 18+ on the PATH):
+
+```
+/plugin install meshcentral --marketplace troymroberts/meshcentral-mcp
+```
+
+On older versions: `/plugin marketplace add troymroberts/meshcentral-mcp`, then `/plugin install meshcentral@meshcentral-mcp`. Claude Code installs the npm dependencies itself.
+
+Enabling the plugin asks for its settings (change them later with `/plugin configure meshcentral@meshcentral-mcp`):
+
+| Setting | Maps to | Notes |
+|---------|---------|-------|
+| MeshCentral server URL | `MESH_SERVER_URL` | required |
+| Login token user / password | `MESH_TOKEN_USER` / `MESH_TOKEN_PASS` | the password is stored in the system credential store |
+| Capability profile | `MESH_MCP_PROFILE` | default `support` |
+| Accept a self-signed certificate | `MESH_INSECURE_TLS` | |
+| Settings file | `MESH_ENV_FILE` | optional `.env` with any other `MESH_*` setting, or `MESH_USERNAME`/`MESH_PASSWORD` |
+
+Blank settings fall through to the settings file, then to the defaults. The audit log goes to the plugin's data folder (`~/.claude/plugins/data/...`), which survives updates.
+
+- **Chat push:** start Claude Code with `claude --dangerously-load-development-channels plugin:meshcentral@meshcentral-mcp`.
+- **Tool names** are prefixed `mcp__plugin_meshcentral_meshcentral__` (e.g. `..._mesh_chat_open`), which matters for permission rules.
+- **Updates:** every commit to the repo is a new version. Update with `/plugin` > Marketplaces > Update, or turn on auto-update there.
+- If you previously added this server by hand (MCP config or a clone's `.mcp.json`), remove that entry, or you will have the tools twice.
+
+The manual setup below is for other MCP clients and for development.
+
 ## Setup
 
 ### 1. Install

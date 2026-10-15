@@ -27,7 +27,17 @@ export function parseEnvFile(text) {
   return out;
 }
 
+// Settings left blank in a Claude Code plugin's configuration reach the server
+// as empty strings (or, if never set, possibly as the unexpanded placeholder).
+// Treat both as unset so a .env file or the built-in defaults apply.
+export function dropBlankSettings(env = process.env) {
+  for (const [k, v] of Object.entries(env)) {
+    if (/^MESH_/.test(k) && (v === '' || /^\$\{user_config\.[A-Za-z0-9_]+\}$/.test(v))) delete env[k];
+  }
+}
+
 export function loadDotEnv(env = process.env) {
+  dropBlankSettings(env);
   const candidates = [env.MESH_ENV_FILE, path.join(REPO_ROOT, '.env')].filter(Boolean);
   for (const file of candidates) {
     let text;
@@ -132,7 +142,7 @@ export function loadConfig(env = process.env) {
     commandMaxTimeoutSeconds: int(env.MESH_COMMAND_MAX_TIMEOUT_SECONDS, 3600),
     // Local JSON-lines activity record ('off' disables) and what is also posted to
     // each device's MeshCentral event log: off | changes | all.
-    auditLog: auditPath(env.MESH_MCP_AUDIT_LOG),
+    auditLog: auditPath(env.MESH_MCP_AUDIT_LOG, env.CLAUDE_PLUGIN_DATA),
     deviceEvents: (env.MESH_MCP_DEVICE_EVENTS || 'changes').toLowerCase(),
     maxOutputChars: int(env.MESH_MCP_MAX_OUTPUT, 100_000),
     terminalIdleMinutes: int(env.MESH_TERMINAL_IDLE_MINUTES, 15),
@@ -144,9 +154,11 @@ export function loadConfig(env = process.env) {
   };
 }
 
-function auditPath(value) {
+// Default: logs/ in the plugin's persistent data folder when run as a Claude
+// Code plugin (the code folder is replaced on every update), else in the repo.
+function auditPath(value, dataDir) {
   if (value && /^(off|false|none|0)$/i.test(value.trim())) return null;
-  return value ? path.resolve(value) : path.join(REPO_ROOT, 'logs', 'audit.jsonl');
+  return value ? path.resolve(value) : path.join(dataDir || REPO_ROOT, 'logs', 'audit.jsonl');
 }
 
 function bool(value, fallback) {

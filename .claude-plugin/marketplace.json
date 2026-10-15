@@ -1,0 +1,14 @@
+{
+  "name": "meshcentral-mcp",
+  "description": "MeshCentral remote support tools for Claude Code.",
+  "owner": {
+    "name": "troymroberts"
+  },
+  "plugins": [
+    {
+      "name": "meshcentral",
+      "source": ".",
+      "description": "MeshCentral remote support for Claude Code: inventory, diagnostics, commands, terminals, remote desktop, file transfer and chat."
+    }
+  ]
+}

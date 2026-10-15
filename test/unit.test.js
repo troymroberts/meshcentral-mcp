@@ -276,3 +276,15 @@ test('winEventsScript: suppresses ignored events before the cap and counts them'
   assert.doesNotMatch(none, /Suppress/);
   assert.match(none, /\$ev_ignored = @\(\)/);
 });
+
+test('dropBlankSettings: blank or unexpanded plugin settings count as unset', async () => {
+  const { dropBlankSettings, loadConfig } = await import('../src/config.js');
+  const env = {
+    MESH_SERVER_URL: 'https://mesh.example.com', MESH_TOKEN_USER: '', MESH_TOKEN_PASS: '${user_config.token_pass}',
+    MESH_ENV_FILE: '', MESH_USERNAME: 'tech', MESH_PASSWORD: 'pw', OTHER: '',
+  };
+  dropBlankSettings(env);
+  assert.deepEqual(env, { MESH_SERVER_URL: 'https://mesh.example.com', MESH_USERNAME: 'tech', MESH_PASSWORD: 'pw', OTHER: '' });
+  assert.equal(loadConfig(env).credentials.kind, 'username/password');
+  assert.match(loadConfig({ ...env, CLAUDE_PLUGIN_DATA: '/data/mesh' }).auditLog, /^\/data\/mesh\/logs\/audit\.jsonl$/);
+});

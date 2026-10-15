@@ -1,0 +1,58 @@
+{
+  "name": "meshcentral",
+  "description": "MeshCentral remote support for Claude Code: inventory, diagnostics, commands, terminals, remote desktop, file transfer and chat with the person at a device.",
+  "author": { "name": "troymroberts" },
+  "homepage": "https://github.com/troymroberts/meshcentral-mcp",
+  "repository": "https://github.com/troymroberts/meshcentral-mcp",
+  "keywords": ["meshcentral", "remote-support", "rmm", "mcp"],
+  "userConfig": {
+    "server_url": {
+      "type": "string",
+      "title": "MeshCentral server URL",
+      "description": "e.g. https://mesh.example.com (include the domain path if you use one)",
+      "required": true
+    },
+    "token_user": {
+      "type": "string",
+      "title": "Login token user",
+      "description": "From My Account > Login tokens in MeshCentral; starts with ~t:. Leave blank to use the settings file below."
+    },
+    "token_pass": {
+      "type": "string",
+      "title": "Login token password",
+      "description": "The password half of the login token.",
+      "sensitive": true
+    },
+    "profile": {
+      "type": "string",
+      "title": "Capability profile",
+      "description": "readonly, support, operations or admin (see docs/PERMISSIONS.md).",
+      "default": "support"
+    },
+    "insecure_tls": {
+      "type": "boolean",
+      "title": "Accept a self-signed certificate",
+      "description": "Only for a MeshCentral server without a trusted TLS certificate.",
+      "default": false
+    },
+    "env_file": {
+      "type": "file",
+      "title": "Settings file (optional)",
+      "description": "A .env file with further MESH_* settings, or MESH_USERNAME/MESH_PASSWORD instead of a token. Values above take precedence."
+    }
+  },
+  "mcpServers": {
+    "meshcentral": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/src/index.js"],
+      "env": {
+        "MESH_SERVER_URL": "${user_config.server_url}",
+        "MESH_TOKEN_USER": "${user_config.token_user}",
+        "MESH_TOKEN_PASS": "${user_config.token_pass}",
+        "MESH_MCP_PROFILE": "${user_config.profile}",
+        "MESH_INSECURE_TLS": "${user_config.insecure_tls}",
+        "MESH_ENV_FILE": "${user_config.env_file}"
+      }
+    }
+  }
+}
