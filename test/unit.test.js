@@ -208,3 +208,16 @@ test('ChatSession re-joins the relay while waiting for the user, and gives up af
   late.close('x'); // joinMs 0: a drop ends it instead of re-joining
   assert.equal(late.isOpen, false);
 });
+
+test('ChatSession reports joined / message / ended events', async () => {
+  const { EventEmitter } = await import('events');
+  const { ChatSession } = await import('../src/chat.js');
+  const ws = Object.assign(new EventEmitter(), { readyState: 1, send() {}, close() { this.readyState = 3; this.emit('close'); } });
+  const events = [];
+  const s = new ChatSession({ id: 'c', ws, nodeId: 'n', nodeName: 'PC', idleMs: 60_000, onEvent: (_, kind, text) => events.push([kind, text]) });
+  ws.emit('message', Buffer.from('c'));
+  ws.emit('message', Buffer.from('c')); // repeated pairing notice: one 'joined' only
+  ws.emit('message', Buffer.from(JSON.stringify({ action: 'chat', msg: 'hello' })));
+  s.close('done');
+  assert.deepEqual(events, [['joined', null], ['message', 'hello'], ['ended', 'done']]);
+});

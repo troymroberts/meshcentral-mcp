@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "meshcentral": {
+      "command": "node",
+      "args": ["src/index.js"],
+      "env": { "MESH_MCP_PROFILE": "support" }
+    }
+  }
+}

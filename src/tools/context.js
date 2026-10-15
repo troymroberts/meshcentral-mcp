@@ -5,7 +5,7 @@ import { TerminalManager } from '../terminal.js';
 import { DesktopManager } from '../desktop.js';
 import { ChatManager } from '../chat.js';
 import { isReadOnlyCommand } from '../readonly.js';
-import { sanitizeText, errorResult, isServerError, UNTRUSTED_NOTE } from '../safety.js';
+import { sanitizeText, errorResult, isServerError, deviceResult, UNTRUSTED_NOTE } from '../safety.js';
 import { AGENT_GUARD_MESSAGE } from '../agent-guard.js';
 import { AuditLog, redactArgs } from '../audit.js';
 
@@ -57,7 +57,19 @@ export function createContext({ server, client, policy, gate, config, audit = ne
     maxSessions: config.desktopMaxSessions,
     idleFrameMs: config.desktopIdleFrameMs,
   });
-  const chats = new ChatManager({ client, idleMinutes: config.chatIdleMinutes ?? 30 });
+  // Chat events are pushed to the client as Claude Code channel events
+  // (notifications/claude/channel). A client that has not loaded this server as
+  // a channel drops them silently; mesh_chat_read still returns every message.
+  const pushChatEvent = (session, kind, text) => {
+    if (config.chatPush === false || !server.server?.notification) return;
+    const meta = { chat_id: session.id, device: session.nodeName, event: kind };
+    const content = kind === 'message'
+      ? `${session.nodeName} user wrote:\n${deviceResult(text).content[0].text}`
+      : kind === 'joined' ? `The user at ${session.nodeName} joined the chat.`
+      : `The chat with ${session.nodeName} ended (${text}).`;
+    server.server.notification({ method: 'notifications/claude/channel', params: { content, meta } }).catch(() => {});
+  };
+  const chats = new ChatManager({ client, idleMinutes: config.chatIdleMinutes ?? 30, onEvent: pushChatEvent });
 
   const registered = [];
   const known = []; // every tool name, registered or not (to catch typos in ENABLE/DISABLE_TOOLS)

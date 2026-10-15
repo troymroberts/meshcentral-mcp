@@ -24,7 +24,9 @@ export class ChatSession {
   #connect;
   #joinDeadline;
 
-  constructor({ id, ws, connect = null, nodeId, nodeName, idleMs, joinMs = 5 * 60_000, onEnd }) {
+  #onEvent;
+
+  constructor({ id, ws, connect = null, nodeId, nodeName, idleMs, joinMs = 5 * 60_000, onEnd, onEvent = null }) {
     this.id = id;
     this.nodeId = nodeId;
     this.nodeName = nodeName;
@@ -34,6 +36,7 @@ export class ChatSession {
     this.closedReason = null;
     this.#idleMs = idleMs;
     this.#onEnd = onEnd;
+    this.#onEvent = onEvent;
     this.#connect = connect;
     this.#joinDeadline = Date.now() + joinMs;
     this.#attach(ws);
@@ -81,7 +84,12 @@ export class ChatSession {
 
   #onMessage(data) {
     const text = data.toString();
-    if (text === 'c' || text === 'cr') { this.connected = true; this.#notify(); return; }
+    if (text === 'c' || text === 'cr') {
+      if (!this.connected) this.#emit('joined');
+      this.connected = true;
+      this.#notify();
+      return;
+    }
     let msg;
     try { msg = JSON.parse(text); } catch { return; }
     if (msg.ctrlChannel === '102938') {
@@ -91,11 +99,17 @@ export class ChatSession {
     if (msg.action === 'chat' && typeof msg.msg === 'string') {
       this.messages.push({ from: 'user', text: msg.msg, at: Date.now() });
       this.typing = false;
+      this.#emit('message', msg.msg);
       this.#armIdle();
       this.#notify();
     } else if (msg.action === 'outtext') {
       this.typing = Boolean(msg.value);
     }
+  }
+
+  // Report to the manager (which pushes it to the MCP client as a channel event).
+  #emit(kind, text = null) {
+    try { this.#onEvent?.(this, kind, text); } catch {}
   }
 
   #send(obj) { this.#ws.send(JSON.stringify(obj)); }
@@ -130,6 +144,7 @@ export class ChatSession {
     if (this.closedReason) return;
     this.closedReason = reason;
     clearTimeout(this.#idleTimer);
+    this.#emit('ended', reason);
     this.#notify();
     this.#onEnd?.(this);
   }
@@ -145,9 +160,13 @@ export class ChatManager {
   #client;
   #idleMs;
 
-  constructor({ client, idleMinutes = 30 }) {
+  #onEvent;
+
+  // onEvent(session, kind, text): kind is 'joined', 'message' or 'ended'.
+  constructor({ client, idleMinutes = 30, onEvent = null }) {
     this.#client = client;
     this.#idleMs = idleMinutes * 60_000;
+    this.#onEvent = onEvent;
   }
 
   get(id) {
@@ -174,6 +193,7 @@ export class ChatManager {
     const ws = await connect();
     const session = new ChatSession({
       id: `chat_${crypto.randomBytes(5).toString('hex')}`, ws, connect, nodeId: node._id, nodeName: node.name, idleMs: this.#idleMs,
+      onEvent: this.#onEvent,
       // Keep ended sessions for a while so the last messages can still be read.
       onEnd: (s) => setTimeout(() => { if (this.#sessions.get(s.id) === s) this.#sessions.delete(s.id); }, 10 * 60_000).unref?.(),
     });
