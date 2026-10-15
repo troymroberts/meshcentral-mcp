@@ -85,6 +85,19 @@ Running commands - one at a time per device:
   read-only lines are auto-approved, a combined script asks the user, and a slow
   script blocks the device for other commands.
 
+Showing commands to the human - they must be able to follow every command:
+- mesh_run_command, mesh_terminal_input and mesh_agent_console take a required
+  purpose: one plain-English sentence saying what the command does and why you
+  are running it now. The human reads it in the approval prompt, so write it for
+  someone who cannot read the command itself.
+- MCP clients (e.g. Claude Code) collapse tool calls and their output, so the
+  human does not see them unless you repeat them. After each such call -
+  including auto-approved read-only ones - show in your reply: the purpose, the
+  command in a code block (with the device name), and the relevant output in a
+  code block (trim long output to the lines that matter and say you trimmed it).
+  Then say what the output means. Batch several calls into one such summary
+  when you ran them back to back.
+
 The Mesh Agent is the only way to reach a device. Never stop, restart, kill,
 disable, reconfigure or uninstall it, and do not power a device off or put it to
 sleep, unless the human explicitly asks: such actions are blocked unless you pass

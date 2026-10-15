@@ -365,3 +365,25 @@ test('mesh_job_cancel by device drops queued jobs before they are sent', async (
   assert.equal(runs(client).length, 1); // the queued "uptime" was never sent
   cleanup();
 });
+
+// ── purpose (plain-English intent for the human) ───────────────────────
+
+test('command tools take purpose first; it leads the approval prompt and heads the result', async () => {
+  const { server, client, call, cleanup } = setup({ confirmMode: 'token' });
+  for (const name of ['mesh_run_command', 'mesh_terminal_input', 'mesh_agent_console'])
+    assert.equal(Object.keys(server.tools[name].meta.inputSchema)[0], 'purpose', name);
+
+  const purpose = 'Restart the print spooler so queued jobs print again';
+  const args = { purpose, node_id: 'Prudecon-File', type: 2, command: 'Restart-Service Spooler' };
+  const prompt = await call('mesh_run_command', args);
+  assert.match(prompt.text, new RegExp(`Purpose: ${purpose}\\n.*Restart-Service Spooler`));
+
+  const token = prompt.text.match(/confirm_token: "(\w+)"/)[1];
+  const done = await call('mesh_run_command', { ...args, confirm_token: token });
+  assert.match(done.text, new RegExp(`^Purpose: ${purpose}\\nApproval: approved by you`));
+
+  client.run = async () => 'web01';
+  const auto = await call('mesh_run_command', { purpose: 'Check the machine name', node_id: 'web01', command: 'hostname' });
+  assert.match(auto.text, /^Purpose: Check the machine name\nApproval: auto-approved \(read-only\)\n.*hostname/);
+  cleanup();
+});

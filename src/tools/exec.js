@@ -36,7 +36,7 @@ export default function register(ctx) {
   // ════════════════════════════════════════════════════════════════════════
 
   define({
-    name: 'mesh_run_command', tier: 'X', title: 'Run command',
+    name: 'mesh_run_command', tier: 'X', title: 'Run command', explain: true,
     description:
       'Run a shell command on one device (node_id) or the same command on several (node_ids, run in parallel, one ' +
       'approval) and capture the output. type: 0 auto, 1 CMD, 2 PowerShell, 3 Linux/macOS. ' +
@@ -173,7 +173,7 @@ export default function register(ctx) {
   const AGENT_CONSOLE_RISK = new Set(['exit', 'kill', 'restart', 'uninstall', 'fullupdate', 'agentupdate', 'agentupdateex', 'service', 'die']);
 
   define({
-    name: 'mesh_agent_console', tier: 'X', title: 'Agent console',
+    name: 'mesh_agent_console', tier: 'X', title: 'Agent console', explain: true,
     description: 'Run a MeshAgent console command and capture its output (e.g. "help", "coreinfo", "netinfo", "versions").',
     annotations: { destructiveHint: true },
     confirmSummary: async ({ node_id, command }) => `Agent console on ${node_id}: ${command}`,
@@ -227,7 +227,7 @@ export default function register(ctx) {
   });
 
   define({
-    name: 'mesh_terminal_input', tier: 'X', title: 'Terminal input',
+    name: 'mesh_terminal_input', tier: 'X', title: 'Terminal input', explain: true,
     description:
       'Send input to an open terminal and return the new output. By default a carriage return is appended ' +
       '(submit=true) and the call waits until the command finishes (the shell prompt returns) or wait_ms elapses ' +

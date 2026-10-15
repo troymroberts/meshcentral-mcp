@@ -62,6 +62,21 @@ export function createContext({ server, client, policy, gate, config, audit = ne
 
   const registered = [];
 
+  const PURPOSE_SCHEMA = z.string().min(1).describe(
+    'One plain-English sentence for the human: what this command does and why you are running it now, ' +
+    'e.g. "List services that are set to start automatically but are stopped, to find why printing fails". ' +
+    'No jargon the command itself does not need.'
+  );
+  const purposeOf = (args) => String(args?.purpose ?? '').replace(/\s+/g, ' ').trim();
+  const APPROVAL_LABEL = {
+    'auto-readonly': 'auto-approved (read-only)',
+    prompt: 'approved by you',
+    token: 'approved by you (token)',
+    grant: 'covered by a session approval you gave',
+    off: 'confirmation disabled',
+    'not-required': 'not required by policy',
+  };
+
   // define() applies policy gating, the Mesh Agent guard, confirmation, the
   // activity record, and uniform error handling.
   //   autoApprove(args)  true for plainly read-only calls; they skip confirmation
@@ -73,13 +88,16 @@ export function createContext({ server, client, policy, gate, config, audit = ne
   //   change(args)       whether a call changes the device; default: W/X/WF/P/A
   //                      tiers unless it was read-only
   //   describe(args)     record summary for tools without a confirmSummary
+  //   explain            require a plain-English `purpose` argument: it leads the
+  //                      approval prompt, heads the result and goes into the record
   function define({
     name, tier, title, description, schema = {}, annotations = {}, confirmSummary = null, autoApprove = null,
-    agentRisk = null, audit: auditable = tier !== 'R', change = null, describe = null, handler,
+    agentRisk = null, audit: auditable = tier !== 'R', change = null, describe = null, explain = false, handler,
   }) {
     if (!policy.allows(name, tier)) return;
     const confirmable = confirmSummary && CONFIRMABLE.has(tier);
-    const inputSchema = { ...schema };
+    // purpose goes first: clients show the leading arguments of a collapsed call.
+    const inputSchema = explain ? { purpose: PURPOSE_SCHEMA, ...schema } : { ...schema };
     if (agentRisk) {
       inputSchema.allow_agent_disruption = z
         .boolean()
@@ -121,7 +139,8 @@ export function createContext({ server, client, policy, gate, config, audit = ne
           } else {
             if (confirmable && (risk || (policy.needsConfirm(tier) && !(readOnly && policy.autoApproveReadOnly)))) {
               summary = await humanizeIds(await confirmSummary(args), args);
-              const prompt = risk ? `WARNING - MAY CUT OFF REMOTE ACCESS (${risk}).\n${summary}` : summary;
+              const why = explain ? `Purpose: ${purposeOf(args)}\n` : '';
+              const prompt = risk ? `WARNING - MAY CUT OFF REMOTE ACCESS (${risk}).\n${why}${summary}` : `${why}${summary}`;
               const device = nodes.length === 1 ? { id: nodes[0].id, label: nodes[0].name } : null;
               const d = await gate.decide(name, prompt, args, tier, {
                 nodeIds: nodes.map((n) => n.id), device, forcePrompt: Boolean(risk),
@@ -131,7 +150,10 @@ export function createContext({ server, client, policy, gate, config, audit = ne
             } else if (readOnly) {
               approval = 'auto-readonly';
             }
-            if (!result) result = await handler(args, extra);
+            if (!result) {
+              result = await handler(args, extra);
+              if (explain) result = withPurpose(result, args, approval);
+            }
           }
         } catch (err) {
           result = errorResult(err.message);
@@ -143,6 +165,7 @@ export function createContext({ server, client, policy, gate, config, audit = ne
                 : confirmSummary ? await humanizeIds(await confirmSummary(args), args)
                 : `${name} ${JSON.stringify(redactArgs(args))}`;
             }
+            if (explain && purposeOf(args)) summary = `${summary} (purpose: ${purposeOf(args)})`;
             const executed = !['blocked', 'denied'].includes(approval);
             const isChange = executed && (change ? change(args, approval) : CHANGE_TIERS.has(tier) && approval !== 'auto-readonly');
             const text = firstLine(result);
@@ -159,6 +182,16 @@ export function createContext({ server, client, policy, gate, config, audit = ne
       }
     );
     registered.push({ name, tier });
+  }
+
+  // Heads a command result with what it was for and how it was approved, so the
+  // human reading the call sees intent first, then command and output.
+  function withPurpose(result, args, approval) {
+    const how = APPROVAL_LABEL[approval];
+    const head = `Purpose: ${purposeOf(args)}${how ? `\nApproval: ${how}` : ''}`;
+    const [first, ...rest] = result?.content ?? [];
+    if (first?.type !== 'text') return result;
+    return { ...result, content: [{ ...first, text: `${head}\n${first.text}` }, ...rest] };
   }
 
   // Devices a call touches, for approval scoping and the activity record.
