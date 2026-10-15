@@ -183,6 +183,41 @@ s recent_reboots; last -x reboot shutdown 2>/dev/null | head -5
     return `Findings: ${flags.length ? '\n  - ' + flags.join('\n  - ') : 'none flagged'}\n${body}`;
   }
 
+  async function healthReport(node, days, deep = false) {
+    return isWindowsNode(node)
+      ? formatWindowsHealth(await runShell(node, WIN_HEALTH(days, deep), 2, deep ? 600_000 : 240_000))
+      : formatLinuxHealth(await runShell(node, LINUX_HEALTH(days), 3, 180_000));
+  }
+
+  // Warnings and errors of the last few hours, grouped, plus failed logons: what
+  // is going on right now, as opposed to the health check's multi-day view.
+  const WIN_RECENT = (hours) => `
+$ErrorActionPreference = 'SilentlyContinue'
+$since = (Get-Date).AddHours(-${hours})
+$ev = @(Get-WinEvent -FilterHashtable @{ LogName = 'System', 'Application'; Level = 1, 2, 3; StartTime = $since } -MaxEvents 2000)
+"warnings and errors (System+Application): $($ev.Count)"
+$ev | Group-Object LogName, ProviderName, Id | Sort-Object Count -Descending | Select-Object -First 15 | ForEach-Object {
+  $e = $_.Group[0]; $m = "$($e.Message)" -replace '\\s+', ' '
+  '  {0}x {1}/{2} {3} {4} (last {5}): {6}' -f $_.Count, $e.LogName, $e.ProviderName, $e.Id, $e.LevelDisplayName, $e.TimeCreated.ToString('s'), $m.Substring(0, [math]::Min(200, $m.Length)) }
+$fl = @(Get-WinEvent -FilterHashtable @{ LogName = 'Security'; Id = 4625; StartTime = $since } -MaxEvents 1000)
+"failed logons (Security 4625): $($fl.Count)"
+$fl | Group-Object { $_.Properties[5].Value } | Sort-Object Count -Descending | Select-Object -First 5 | ForEach-Object { "  $($_.Count)x account $($_.Name)" }
+`;
+  const LINUX_RECENT = (hours) =>
+    `journalctl --no-pager -q -o short-iso -p warning --since '${hours} hours ago' 2>&1 | tail -n 40; ` +
+    `echo "failed logins: $(journalctl --no-pager -q --since '${hours} hours ago' 2>/dev/null | grep -ciE 'authentication failure|failed password')"`;
+
+  async function recentEvents(node, hours) {
+    const out = isWindowsNode(node)
+      ? await runShell(node, WIN_RECENT(hours), 2, 180_000)
+      : await runShell(node, LINUX_RECENT(hours), 3, 120_000);
+    return out.trim() || '(nothing)';
+  }
+
+  // Used by mesh_chat_open's background diagnostics.
+  ctx.healthReport = healthReport;
+  ctx.recentEvents = recentEvents;
+
   define({
     name: 'mesh_health_check', tier: 'RF', title: 'Health check',
     description:
@@ -202,11 +237,8 @@ s recent_reboots; last -x reboot shutdown 2>/dev/null | head -5
     handler: async ({ node_id, node_ids, days, deep }, extra) => {
       const nodes = await targets({ node_id, node_ids });
       const d = days ?? 7;
-      const results = await withProgress(extra, `Health check on ${nodes.length} device(s)`, () => perDevice(nodes, async (node) =>
-        isWindowsNode(node)
-          ? formatWindowsHealth(await runShell(node, WIN_HEALTH(d, Boolean(deep)), 2, deep ? 600_000 : 240_000))
-          : formatLinuxHealth(await runShell(node, LINUX_HEALTH(d), 3, 180_000))
-      ));
+      const results = await withProgress(extra, `Health check on ${nodes.length} device(s)`, () =>
+        perDevice(nodes, (node) => healthReport(node, d, Boolean(deep))));
       const text = results.map(({ node, out, error }) =>
         `=== ${node.name}${error ? ' (FAILED)' : ''} ===\n${error ?? out}`).join('\n\n');
       return deviceResult(text, `Health check (${d}-day window):`);

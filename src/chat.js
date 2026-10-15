@@ -50,6 +50,7 @@ export class ChatSession {
   #onEnd;
   #waiters = new Set();
   messages = []; // { from: 'user' | 'you', text, at }
+  diagnostics = null; // { status: 'running' | 'done' | 'failed', text, error, startedAt, finishedAt }
   #readUpTo = 0;
 
   #connect;
@@ -141,6 +142,13 @@ export class ChatSession {
   // Report to the manager (which pushes it to the MCP client as a channel event).
   #emit(kind, text = null) {
     try { this.#onEvent?.(this, kind, text); } catch {}
+  }
+
+  // Background diagnostics finished: wake waiters and report it like chat activity.
+  setDiagnostics(result) {
+    this.diagnostics = { ...this.diagnostics, ...result, finishedAt: Date.now() };
+    this.#notify();
+    this.#emit('diagnostics');
   }
 
   #send(obj) { this.#ws.send(JSON.stringify(obj)); }

@@ -11,7 +11,7 @@
     --chat-bar: #003366;
     --chat-bar-text: #f2f5f9;
     --chat-them-bg: #ffffff;
-    --chat-them-text: #1c2430;
+    --chat-them-text: #111821;
     --chat-them-border: #dde3ea;
     --chat-me-bg: #2563eb;
     --chat-me-text: #ffffff;
@@ -49,10 +49,10 @@ body {
 }
 
     #xtop > div[style*="position:absolute"] { background-color: var(--chat-bar) !important; }
-    #xtop > div:last-child { font-size: 17px !important; padding-top: 10px !important; padding-left: 8px !important; }
+    #xtop > div:last-child { font-size: 18px !important; padding-top: 9px !important; padding-left: 8px !important; }
 
 #xmiddle {
-    font-size: 15px !important;
+    font-size: 17px !important;
     bottom: 56px !important;
     background-color: var(--chat-bg);
 }
@@ -62,10 +62,11 @@ body {
 .remoteBubble,
 .localBubble {
     max-width: min(75%, 640px);
-    padding: 8px 12px;
+    padding: 9px 14px;
     margin-bottom: 8px;
     border-radius: 14px;
-    line-height: 1.45;
+    line-height: 1.5;
+    font-weight: 600;
     white-space: pre-wrap;
     overflow-wrap: anywhere;
     box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
@@ -92,7 +93,7 @@ body {
 #xmsg div[style*="color:gray"] {
     float: none !important;
     text-align: center;
-    font-size: 12px;
+    font-size: 13px;
     color: var(--chat-notice) !important;
     margin: 4px 0 10px !important;
 }
@@ -111,7 +112,7 @@ body {
 #xouttext {
     height: 40px;
     padding: 0 14px;
-    font-size: 15px !important;
+    font-size: 17px !important;
     font-family: inherit;
     color: var(--chat-them-text);
     background-color: var(--chat-input-bg);
@@ -126,7 +127,7 @@ body {
 #clearButton {
     height: 40px;
     padding: 0 18px;
-    font-size: 15px !important;
+    font-size: 16px !important;
     font-family: inherit;
     border-radius: 20px;
     border: 1px solid transparent;

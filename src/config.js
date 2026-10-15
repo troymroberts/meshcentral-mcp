@@ -107,6 +107,7 @@ export function loadConfig(env = process.env) {
     sessionApproval: bool(env.MESH_MCP_SESSION_APPROVAL, true),
     // Push chat messages to Claude Code as channel events (needs the session to load this server as a channel).
     chatPush: bool(env.MESH_MCP_CHAT_PUSH, true),
+    chatDiagnostics: bool(env.MESH_MCP_CHAT_DIAGNOSTICS, true),
     // How long an approval prompt waits for the human.
     approvalTimeoutMs: int(env.MESH_MCP_APPROVAL_TIMEOUT_MINUTES, 30) * 60_000,
     // Default / maximum wait for mesh_run_command output.

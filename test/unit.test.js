@@ -239,3 +239,19 @@ test('formatChatMessage: plain text, one bubble or one per line', async () => {
   assert.deepEqual(formatChatMessage('hello', false), ['hello']);
   assert.deepEqual(formatChatMessage('a\r\nb', false), ['a', 'b']);
 });
+
+test('ChatSession.setDiagnostics: wakes waiters and reports a diagnostics event', async () => {
+  const { ChatSession } = await import('../src/chat.js');
+  const { EventEmitter } = await import('events');
+  const ws = Object.assign(new EventEmitter(), { readyState: 1, send() {}, close() {} });
+  const events = [];
+  const s = new ChatSession({ id: 'chat_d', ws, nodeId: 'node//a', nodeName: 'PC', idleMs: 60_000, onEvent: (_s, kind) => events.push(kind) });
+  s.diagnostics = { status: 'running', startedAt: Date.now() };
+  const waited = s.wait(() => s.diagnostics.status !== 'running', 5_000);
+  s.setDiagnostics({ status: 'done', text: 'disk C: 14% free' });
+  await waited;
+  assert.equal(s.diagnostics.status, 'done');
+  assert.ok(s.diagnostics.finishedAt >= s.diagnostics.startedAt);
+  assert.deepEqual(events, ['diagnostics']);
+  s.close();
+});

@@ -60,12 +60,21 @@ export function createContext({ server, client, policy, gate, config, audit = ne
   // Chat events are pushed to the client as Claude Code channel events
   // (notifications/claude/channel). A client that has not loaded this server as
   // a channel drops them silently; mesh_chat_read still returns every message.
+  const diagnosticsText = (session) => {
+    const d = session.diagnostics;
+    if (!d || d.status === 'running') return `Background diagnostics for ${session.nodeName} are still running.`;
+    if (d.status === 'failed') return `Background diagnostics for ${session.nodeName} failed: ${d.error}`;
+    const secs = Math.round((d.finishedAt - d.startedAt) / 1000);
+    return `Background diagnostics for ${session.nodeName} (started with the chat, took ${secs}s; read-only):\n` +
+      deviceResult(d.text).content[0].text;
+  };
   const pushChatEvent = (session, kind, text) => {
     if (config.chatPush === false || !server.server?.notification) return;
     const meta = { chat_id: session.id, device: session.nodeName, event: kind };
     const content = kind === 'message'
       ? `${session.nodeName} user wrote:\n${deviceResult(text).content[0].text}`
       : kind === 'joined' ? `The user at ${session.nodeName} joined the chat.`
+      : kind === 'diagnostics' ? diagnosticsText(session)
       : `The chat with ${session.nodeName} ended (${text}).`;
     server.server.notification({ method: 'notifications/claude/channel', params: { content, meta } }).catch(() => {});
   };
@@ -652,7 +661,7 @@ export function createContext({ server, client, policy, gate, config, audit = ne
   }
 
   return {
-    server, client, policy, gate, config, audit, registered, known, terminals, desktops, chats, define,
+    server, client, policy, gate, config, audit, registered, known, terminals, desktops, chats, define, diagnosticsText,
     meshId, allNodes, allMeshes, humanizeIds, getNode, requireNode, resolveNodeId, resolveNodeIds, isWindowsNode,
     withStatus, lastConnect, lastConnects, deviceEvents, ago,
     RUN_TYPE_LABEL, readOnlyFor, withProgress, READONLY_AGENT_CONSOLE,
