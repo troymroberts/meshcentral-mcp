@@ -30,7 +30,7 @@ export default function register(ctx) {
       const maxWidth = max_width ?? DEFAULT_MAX_WIDTH;
       if (session_id) {
         const s = desktops.get(session_id);
-        await s.capture({ maxMs: 8_000 }); // burst if idle-paused; freshen if live
+        await s.snapshot(); // live framebuffer; no refresh (see DesktopSession.snapshot)
         if (!s.hasFrame()) return errorResult('No frame available for that session yet.');
         return imageResult(s.encodeJpeg({ maxWidth }), `Desktop (session ${session_id}):`, s);
       }
@@ -71,11 +71,10 @@ export default function register(ctx) {
     },
   });
 
-  // Let the input land, then stream one full frame (unpause→refresh→settle→re-pause)
-  // so the model sees the effect without the device streaming while idle.
-  // Watch for the effect's own tiles rather than waiting a fixed time: a fast
-  // effect (typing) returns in a few hundred ms, a slow one (app launch) is caught
-  // when its tiles appear, and a genuine no-op falls back to a forced refresh.
+  // Let the input land, then wait for the effect's own tiles rather than a fixed
+  // time: a fast effect (typing) returns in a few hundred ms, a slow one (app
+  // launch) is caught when its tiles appear, and a genuine no-op returns the live
+  // framebuffer after the grace period (no refresh: it would replay stale tiles).
   async function afterInput(session) {
     await session.capture({ watch: true, settleMs: 300, maxMs: 8_000 });
     return session.encodeJpeg({ maxWidth: DEFAULT_MAX_WIDTH });
