@@ -2,6 +2,7 @@ import fs from 'fs';
 import { z } from 'zod';
 import { resolveLocalPath } from '../local-path.js';
 import { textResult, deviceResult, errorResult } from '../safety.js';
+import { readClipboard } from '../clipboard.js';
 
 // RF — remote data read
 export default function register(ctx) {
@@ -29,17 +30,9 @@ export default function register(ctx) {
     description: 'Read the clipboard contents of a device (agent must be online; empty clipboard returns nothing).',
     schema: { node_id: z.string().describe('Device node ID or name (must be online)') },
     handler: async ({ node_id }) => {
-      const id = await resolveNodeId(node_id);
-      client.sendRaw({ action: 'msg', type: 'getclip', nodeid: id, tag: 3 }).catch(() => {});
-      try {
-        const res = await client.waitForMessage(
-          (m) => m.action === 'msg' && m.type === 'getclip' && m.nodeid === id && m.data !== undefined,
-          15_000
-        );
-        return deviceResult(res.data, 'Clipboard:');
-      } catch {
-        return errorResult('No clipboard data returned (clipboard empty, no desktop session, or clipboard module missing).');
-      }
+      const data = await readClipboard(client, await resolveNodeId(node_id));
+      if (data == null) return errorResult('No clipboard data returned (clipboard empty, no desktop session, or clipboard module missing).');
+      return deviceResult(data, 'Clipboard:');
     },
   });
 

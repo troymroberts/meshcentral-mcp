@@ -1,11 +1,13 @@
 import { z } from 'zod';
 import { agentRisk } from '../agent-guard.js';
 import { waitForFrame, vkFor, VK, noFrameMessage, DEFAULT_MAX_WIDTH, FIRST_FRAME_MS } from '../desktop.js';
-import { textResult, errorResult } from '../safety.js';
+import { textResult, errorResult, deviceResult } from '../safety.js';
+import { runSequence, MAX_SEQUENCE_STEPS } from '../desktop-sequence.js';
+import { readClipboard } from '../clipboard.js';
 
 // X — remote desktop (KVM)
 export default function register(ctx) {
-  const { define, desktops, resolveNodeId, imageResult } = ctx;
+  const { define, desktops, resolveNodeId, imageResult, client } = ctx;
 
   // ── Remote desktop (KVM) ──────────────────────────────────────────────────
   // Screenshot is RF (remote view). Opening a control session and sending input
@@ -178,6 +180,59 @@ export default function register(ctx) {
       if (bad.length) return errorResult(`Unknown key(s): ${bad.join(', ')}`);
       s.hotkey(specs);
       return imageResult(await afterInput(s), `After ${keys.join('+')}:`, s);
+    },
+  });
+
+  // Several inputs in one call, failing closed. Each input waits for its own repaint
+  // like the single-action tools; a read_clipboard step with `expect` aborts the run
+  // on any mismatch (or empty clipboard) and nothing after it is sent. Judgment
+  // steps (reading a dialog, answering a warning) stay with the caller: the result
+  // carries the clipboard values and one screenshot of where the run stopped.
+  const seqStep = z.discriminatedUnion('action', [
+    z.object({ action: z.literal('click'), x: z.number().int().min(0), y: z.number().int().min(0),
+      button: z.enum(['left', 'right', 'middle']).optional(), double: z.boolean().optional() }),
+    z.object({ action: z.literal('type'), text: z.string() }),
+    z.object({ action: z.literal('key'), key: z.string() }),
+    z.object({ action: z.literal('hotkey'), keys: z.array(z.string()).min(1) }),
+    z.object({ action: z.literal('read_clipboard'), expect: z.string().optional(),
+      label: z.string().optional().describe('Name for this read in the result') }),
+  ]);
+  const describeStep = (st) => st.action === 'click' ? `click (${st.x},${st.y})`
+    : st.action === 'type' ? `type ${JSON.stringify(st.text)}`
+    : st.action === 'key' ? `key ${st.key}`
+    : st.action === 'hotkey' ? st.keys.join('+')
+    : `read clipboard${st.expect !== undefined ? ' (must equal expected)' : ''}`;
+
+  define({
+    name: 'mesh_desktop_sequence', tier: 'X', title: 'Desktop input sequence',
+    change: () => false, // individual inputs stay in the local record only; session open/close go to the device log
+    sensitive: true, // returns clipboard contents
+    description:
+      `Run up to ${MAX_SEQUENCE_STEPS} desktop steps in order in one call (click, type, key, hotkey, read_clipboard), ` +
+      'then return the step log, the clipboard values read, and one screenshot. Fails closed: a read_clipboard step with ' +
+      '`expect` stops the run on any mismatch or empty clipboard, and no later step is sent. Use it for fixed, verified ' +
+      'mechanics (select, copy, check); keep decisions such as answering a warning dialog as separate calls.',
+    annotations: { destructiveHint: true },
+    confirmSummary: ({ session_id, steps }) => `Run ${steps.length} steps in desktop ${session_id}: ${steps.map(describeStep).join('; ')}`,
+    agentRisk: async ({ steps }) => agentRisk(steps.filter((st) => st.action === 'type').map((st) => st.text).join('\n')),
+    schema: {
+      session_id: z.string().describe('Session ID'),
+      steps: z.array(seqStep).min(1).max(MAX_SEQUENCE_STEPS).describe('Steps, run in order'),
+    },
+    handler: async ({ session_id, steps }) => {
+      const s = desktops.get(session_id);
+      if (!s.isOpen) return errorResult(`Desktop ${session_id} is closed.`);
+      const res = await runSequence({ session: s, steps, readClip: () => readClipboard(client, s.nodeId) });
+      const status = res.ok
+        ? `Sequence completed: ${steps.length} steps.`
+        : `Sequence STOPPED at step ${res.failure.step} (${res.failure.action}): ${res.failure.reason}. Steps after it were not sent.`;
+      const log = res.steps.map((st) => `${st.i}. ${st.action} ${st.detail}`).join('\n');
+      const clip = res.clipboard.length
+        ? deviceResult(res.clipboard.map((c) => `${c.label}: ${c.value ?? '(empty)'}`).join('\n'), 'Clipboard reads:').content[0].text
+        : '';
+      const header = [status, log, clip].filter(Boolean).join('\n');
+      if (!s.hasFrame()) return textResult(header);
+      return imageResult(s.encodeJpeg({ maxWidth: DEFAULT_MAX_WIDTH }), header, s);
     },
   });
 
