@@ -132,3 +132,32 @@ test('idleFrameMs 0 disables throttling', () => {
   assert.equal(s.frameMs, 100);
   s.close();
 });
+
+// Refresh (cmd 6) makes MeshCentral's desktop multiplexor replay its cached tile
+// history oldest-first, so frames grabbed mid-replay are stale. Screenshots of a
+// live session and no-op inputs must therefore never send one.
+const isRefresh = (b) => b.length === 4 && b[1] === 6;
+
+test('snapshot on a live session returns at once and sends no refresh', async () => {
+  const ws = new FakeWs();
+  const s = mk(ws);
+  ws.binary(screen(64, 48));
+  ws.binary(tile(0, 0, solidJpeg(64, 48, [10, 10, 10])));
+  ws.sent.length = 0;
+  const t0 = Date.now();
+  await s.snapshot();
+  assert.ok(Date.now() - t0 < 100, 'no wait when already streaming at full rate');
+  assert.equal(ws.sent.filter(isRefresh).length, 0);
+  s.close();
+});
+
+test('capture after a no-op input returns without forcing a refresh', async () => {
+  const ws = new FakeWs();
+  const s = mk(ws);
+  ws.binary(screen(64, 48));
+  ws.binary(tile(0, 0, solidJpeg(64, 48, [10, 10, 10])));
+  ws.sent.length = 0;
+  await s.capture({ watch: true, graceMs: 100, maxMs: 2_000 });
+  assert.equal(ws.sent.filter(isRefresh).length, 0);
+  s.close();
+});

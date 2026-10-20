@@ -480,6 +480,30 @@ export class DesktopSession {
   //    caught when its tiles appear — no fixed guess. Only a genuine no-op waits
   //    `graceMs` and then forces a refresh so a frame is always returned.
   // Keeps the stream at full rate so each refresh is serviced in ~90ms, not ~1.5s.
+  // Current screen with no refresh. The framebuffer is kept current by the live
+  // tile stream, so at full rate it can be returned as-is. A refresh is NOT used:
+  // MeshCentral's desktop multiplexor answers it by replaying its cached tile
+  // history oldest-first, so a frame grabbed mid-replay mixes in stale tiles
+  // (old clock, old selection). When throttled to the idle rate, switch to full
+  // rate and wait only for tiles already in flight.
+  snapshot({ settleMs = 250, maxMs = 3_000 } = {}) {
+    const wasLive = this.#frameMs === FRAME_MS_ACTIVE;
+    this.armRethrottle();
+    if (wasLive && this.#fb) return Promise.resolve();
+    const wait = Math.min(maxMs, (this.#idleFrameMs || FRAME_MS_ACTIVE) + (this.#rttMs || 0) + 300);
+    return new Promise((resolve) => {
+      let lastTile = 0;
+      const t0 = Date.now();
+      const off = this.onTile(() => { lastTile = Date.now(); });
+      const iv = setInterval(() => {
+        const now = Date.now();
+        const quiet = lastTile !== 0 && now - lastTile >= settleMs;
+        if (now - t0 >= maxMs || quiet || (lastTile === 0 && now - t0 >= wait)) { off(); clearInterval(iv); resolve(); }
+      }, 30);
+      iv.unref?.();
+    });
+  }
+
   capture({ settleMs = 250, minMs = 120, maxMs = 8_000, watch = false, graceMs = 1500 } = {}) {
     this.#capturing = true; // the monitor stands down while this runs
     this.armRethrottle();
@@ -512,7 +536,10 @@ export class DesktopSession {
         const changed = this.#tiles > startTiles;
         if (elapsed >= maxMs) return done();
         if (changed && elapsed >= minMs && now - lastTile >= settleMs) return done();
-        if (!changed && !forced && elapsed >= graceMs) { forced = true; this.refresh(); } // no effect: force one frame
+        // No tiles within the grace period: the input changed nothing on screen, and the
+        // live framebuffer is already current. Don't refresh (the multiplexor's replay of
+        // cached tiles would make the frame stale).
+        if (!changed && !forced && elapsed >= graceMs) return done();
       }, 30);
       iv.unref?.();
     });
