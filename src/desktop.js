@@ -75,6 +75,7 @@ export class DesktopSession {
   #frameCostMs = null;   // measured refresh->full-frame cost (encode + transfer + settle)
   #monitorTimer = null;  // periodic retune of rtt/frame cost
   #monitorTick = 0;
+  #rx = { bin: 0, bytes: 0, text: 0, cmds: {}, ctrl: [] }; // what the agent sent (for no-frame diagnostics)
   #capturing = false;    // a real capture is in flight; the monitor stands down
 
   constructor({ id, ws, nodeId, idleMs, onExpire, idleFrameMs = 0 }) {
@@ -120,6 +121,14 @@ export class DesktopSession {
   get displayInfo() { return this.#displayInfo; }
 
   // Return and clear agent alerts/messages received since the last call.
+  // Summary of traffic received so far, for explaining a missing first frame.
+  get rxSummary() {
+    const r = this.#rx;
+    const cmds = Object.entries(r.cmds).map(([c, n]) => `${c}x${n}`).join(' ') || 'none';
+    const size = this.#width ? `${this.#width}x${this.#height}` : 'none';
+    return `binary=${r.bin} (${r.bytes} B), cmds=${cmds}, screen=${size}, tiles=${this.#tiles}, text=${r.text}${r.ctrl.length ? ` [${r.ctrl.join('; ')}]` : ''}`;
+  }
+
   takeNotices() { const n = this.#notices; this.#notices = []; return n; }
 
   #notice(kind, text) {
@@ -139,7 +148,14 @@ export class DesktopSession {
   // desync the stream.
   #onMessage(data, isBinary) {
     const b = Buffer.isBuffer(data) ? data : Buffer.from(data);
-    if (isBinary === false) { this.#onControl(b); return; }
+    if (isBinary === false) {
+      this.#rx.text++;
+      if (this.#rx.ctrl.length < 6) this.#rx.ctrl.push(b.toString('utf8').slice(0, 80));
+      this.#onControl(b);
+      return;
+    }
+    this.#rx.bin++;
+    this.#rx.bytes += b.length;
     this.#acc = this.#acc.length ? Buffer.concat([this.#acc, b]) : b;
     this.#parse();
   }
@@ -278,6 +294,7 @@ export class DesktopSession {
   }
 
   #dispatch(cmd, frame) {
+    this.#rx.cmds[cmd] = (this.#rx.cmds[cmd] || 0) + 1;
     switch (cmd) {
       case CMD_TILE:
         if (frame.length >= 8) this.#onTile(frame.readUInt16BE(4), frame.readUInt16BE(6), frame.subarray(8));
@@ -643,9 +660,10 @@ export class DesktopManager {
 export function noFrameMessage(session) {
   const notices = session.takeNotices();
   const said = notices.map((n) => n.text).filter(Boolean).join('; ');
+  const rx = ` Received: ${session.rxSummary}.`;
   return said
-    ? `No desktop frame received. Agent reported: ${said}`
-    : 'No desktop frame received (no active console session to capture, view denied, or another viewer holding the desktop).';
+    ? `No desktop frame received. Agent reported: ${said}.${rx}`
+    : `No desktop frame received (no active console session to capture, view denied, or another viewer holding the desktop).${rx}`;
 }
 
 export const vkFor = (key) => {
