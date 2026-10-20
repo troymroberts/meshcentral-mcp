@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { agentRisk } from '../agent-guard.js';
-import { waitForFrame, vkFor, VK, noFrameMessage, DEFAULT_MAX_WIDTH } from '../desktop.js';
+import { waitForFrame, vkFor, VK, noFrameMessage, DEFAULT_MAX_WIDTH, FIRST_FRAME_MS } from '../desktop.js';
 import { textResult, errorResult } from '../safety.js';
 
 // X — remote desktop (KVM)
@@ -53,7 +53,7 @@ export default function register(ctx) {
     },
     handler: async ({ node_id, display }) => {
       const session = await desktops.open(await resolveNodeId(node_id));
-      await waitForFrame(session, { requireNew: false, maxMs: 10_000 });
+      await waitForFrame(session, { requireNew: false, maxMs: FIRST_FRAME_MS });
       if (display != null) { session.setDisplay(display); await waitForFrame(session, { maxMs: 6_000 }); }
       if (!session.hasFrame()) {
         const msg = noFrameMessage(session);

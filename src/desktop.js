@@ -36,6 +36,14 @@ const IMAGE_JPEG = 1;
 // (Unlike pausing, which wedged the shared KVM slave, this only changes the rate.)
 const FRAME_MS_ACTIVE = 100;
 
+// First frame of a new session. On a slow host the agent can take well over 10s
+// to spawn its KVM slave; streaming settings and refreshes sent before it attaches
+// are dropped, so priming keeps re-sending them until a tile lands.
+export const FIRST_FRAME_MS = 30_000;
+const PRIME_INTERVAL_MS = 1000;
+// Desktop relays: the agent dials back slower for KVM than for a terminal.
+export const DESKTOP_RELAY_TIMEOUT_MS = 45_000;
+
 const INPUT = { KEY: 1, MOUSE: 2, CTRLALTDEL: 10, KEYUNICODE: 85 };
 const MOUSE_BTN = { none: 0x00, left: 0x02, right: 0x08, middle: 0x20 };
 
@@ -93,9 +101,10 @@ export class DesktopSession {
   }
 
   #primeFrames(attempt = 0) {
-    if (this.closed || this.#tiles > 0 || attempt > 8) return;
+    if (this.closed || this.#tiles > 0 || attempt * PRIME_INTERVAL_MS > FIRST_FRAME_MS) return;
+    if (attempt > 0) { this.#sendCompression(); this.#sendUnpause(); }
     this.refresh();
-    const timer = setTimeout(() => this.#primeFrames(attempt + 1), 600);
+    const timer = setTimeout(() => this.#primeFrames(attempt + 1), PRIME_INTERVAL_MS);
     timer.unref?.();
   }
 
@@ -335,6 +344,9 @@ export class DesktopSession {
     this.#sendCompression();
     this.#sendUnpause();
     this.releaseModifiers();
+    // The screen size is the slave's first message: it has attached, so a refresh
+    // now is not dropped (earlier primes may have been).
+    if (this.#tiles === 0) this.refresh();
   }
 
   // Send key-up for Shift/Ctrl/Alt/Win so a chord interrupted mid-press can't
@@ -593,7 +605,7 @@ export class DesktopManager {
 
   async open(nodeId) {
     if (this.#sessions.size >= this.#max) throw new Error(`Too many open desktop sessions (max ${this.#max}). Close one with mesh_desktop_close.`);
-    const ws = await this.#client.openRelay(nodeId, 2);
+    const ws = await this.#client.openRelay(nodeId, 2, { timeoutMs: DESKTOP_RELAY_TIMEOUT_MS });
     const id = `desk_${crypto.randomBytes(5).toString('hex')}`;
     const session = new DesktopSession({
       id, ws, nodeId, idleMs: this.#idleMs, idleFrameMs: this.#idleFrameMs,
@@ -605,11 +617,11 @@ export class DesktopManager {
 
   // Stateless single screenshot: open, wait for a settled frame, encode, close.
   async screenshot(nodeId, opts = {}) {
-    const ws = await this.#client.openRelay(nodeId, 2);
+    const ws = await this.#client.openRelay(nodeId, 2, { timeoutMs: DESKTOP_RELAY_TIMEOUT_MS });
     const session = new DesktopSession({ id: 'oneshot', ws, nodeId, idleMs: 60_000, onExpire: () => {} });
     try {
       if (opts.display != null) session.setDisplay(opts.display);
-      await waitForFrame(session, { requireNew: false, maxMs: 10_000 });
+      await waitForFrame(session, { requireNew: false, maxMs: FIRST_FRAME_MS });
       if (!session.hasFrame()) throw new Error(noFrameMessage(session));
       const enc = session.encodeJpeg(opts);
       enc.displays = session.displays;
