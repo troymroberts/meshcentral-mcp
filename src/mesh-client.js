@@ -401,7 +401,10 @@ export class MeshCentralClient {
       await this.sendRaw({ action: 'msg', type: 'tunnel', nodeid, value: `*/meshrelay.ashx?${query}` });
     }
 
-    const ws = new WebSocket(endpointUrl(this.#config.serverUrl, 'meshrelay.ashx', query), this.#wsOptions());
+    // Our side carries browser=1, like MeshCentral's web client. The server's desktop
+    // multiplexor (p=2) classifies any relay peer WITHOUT it as the agent, so a
+    // viewer missing it is never attached and receives no frames at all.
+    const ws = new WebSocket(endpointUrl(this.#config.serverUrl, 'meshrelay.ashx', `browser=1&${query}`), this.#wsOptions());
 
     await new Promise((resolve, reject) => {
       const cleanup = () => {
