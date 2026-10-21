@@ -39,6 +39,11 @@
       "type": "file",
       "title": "Settings file (optional)",
       "description": "A .env file with further MESH_* settings, or MESH_USERNAME/MESH_PASSWORD instead of a token. Values above take precedence."
+    },
+    "http_credentials": {
+      "type": "file",
+      "title": "HTTP credentials file (optional)",
+      "description": "JSON file of named logins for mesh_http_request (LAN web devices). Default: ~/.config/meshcentral-mcp/http-credentials.json if it exists."
     }
   },
   "mcpServers": {
@@ -51,7 +56,8 @@
         "MESH_TOKEN_PASS": "${user_config.token_pass}",
         "MESH_MCP_PROFILE": "${user_config.profile}",
         "MESH_INSECURE_TLS": "${user_config.insecure_tls}",
-        "MESH_ENV_FILE": "${user_config.env_file}"
+        "MESH_ENV_FILE": "${user_config.env_file}",
+        "MESH_HTTP_CREDENTIALS": "${user_config.http_credentials}"
       }
     }
   }

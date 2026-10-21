@@ -1,4 +1,5 @@
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
@@ -152,10 +153,17 @@ export function loadConfig(env = process.env) {
     // Frame interval (ms) requested while the agent is the only KVM viewer; 0 disables throttling.
     desktopIdleFrameMs: nonNegInt(env.MESH_DESKTOP_IDLE_FRAME_MS, 2000),
     // mesh_http_request: local JSON file of named credentials for LAN web devices.
-    httpCredentialsFile: env.MESH_HTTP_CREDENTIALS ? path.resolve(env.MESH_HTTP_CREDENTIALS) : null,
+    httpCredentialsFile: env.MESH_HTTP_CREDENTIALS ? path.resolve(env.MESH_HTTP_CREDENTIALS) : defaultHttpCredentials(),
     portForwardIdleMinutes: int(env.MESH_PORT_FORWARD_IDLE_MINUTES, 30),
     portForwardMax: int(env.MESH_PORT_FORWARD_MAX, 5),
   };
+}
+
+// mesh_http_request credentials: ~/.config/meshcentral-mcp/http-credentials.json when it
+// exists, so the setting survives plugin updates without any configuration.
+export const DEFAULT_HTTP_CREDENTIALS = path.join(os.homedir(), '.config', 'meshcentral-mcp', 'http-credentials.json');
+function defaultHttpCredentials() {
+  return fs.existsSync(DEFAULT_HTTP_CREDENTIALS) ? DEFAULT_HTTP_CREDENTIALS : null;
 }
 
 // Default: logs/ in the plugin's persistent data folder when run as a Claude

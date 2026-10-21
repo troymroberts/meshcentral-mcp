@@ -4,7 +4,7 @@ import os from 'os';
 import fs from 'fs';
 import path from 'path';
 
-import { parseEnvFile, resolveCredentials, loadConfig } from '../src/config.js';
+import { parseEnvFile, resolveCredentials, loadConfig, DEFAULT_HTTP_CREDENTIALS } from '../src/config.js';
 import {
   sanitizeText, sanitizeDeep, truncate, isServerError, serverResult, errorResult,
   Policy, PROFILES, TIERS, ConfirmationGate, argsDigest,
@@ -309,4 +309,11 @@ test('openRelay re-issues the tunnel request when the agent never connects, with
     for (const s of wss.clients) s.terminate();
     await new Promise((r) => wss.close(r));
   }
+});
+
+test('httpCredentialsFile: explicit setting wins, else the default file only if it exists', () => {
+  const base = { MESH_SERVER_URL: 'https://h', MESH_USERNAME: 'u', MESH_PASSWORD: 'p' };
+  assert.equal(loadConfig({ ...base, MESH_HTTP_CREDENTIALS: '/tmp/x.json' }).httpCredentialsFile, '/tmp/x.json');
+  const c = loadConfig(base).httpCredentialsFile;
+  assert.ok(c === null || c === DEFAULT_HTTP_CREDENTIALS);
 });
