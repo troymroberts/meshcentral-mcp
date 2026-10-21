@@ -681,3 +681,76 @@ test('registry writes on Mesh Agent keys are blocked by the agent guard', async 
   assert.equal(relays.length, 0);
   cleanup();
 });
+
+// ── Inventory plugin tools ──────────────────────────────────────────────
+
+// Plays the Inventory plugin: replies to {action:'plugin', plugin:'inventory'} by requestId.
+function inventoryPlugin(client, handlers) {
+  const waiters = [];
+  client.waitForMessage = (match) => new Promise((resolve, reject) => {
+    waiters.push({ match, resolve });
+    setTimeout(() => reject(new Error('timeout')), 200).unref();
+  });
+  client.sendRaw = async (cmd) => {
+    client.raw.push(cmd);
+    if (cmd.action !== 'plugin' || cmd.plugin !== 'inventory' || !handlers[cmd.pluginaction]) return;
+    let reply;
+    try { reply = { ok: true, result: handlers[cmd.pluginaction](cmd) }; } catch (e) { reply = { ok: false, error: e.message }; }
+    const msg = { action: 'plugin', plugin: 'inventory', method: 'receiveInventoryMessage', requestId: cmd.requestId, ...reply };
+    const w = waiters.find((x) => x.match(msg));
+    if (w) { waiters.splice(waiters.indexOf(w), 1); w.resolve(msg); }
+  };
+}
+
+const JACK = { id: 'inventorynetport/x/1', site: 'ABC/Default', jack: '2-14', room: 'Cashier', patchPanel: 'A', patchPanelPort: '14',
+  switchName: '1 - Ground Floor Main', switchMac: '74:ac:b9:3e:6c:ea', switchPort: 20, status: 'active' };
+const ASSET = { id: 'inventoryasset/x/a1', name: 'Prudecon-File', nodeid: 'node//win1', assetKind: 'workstation', status: 'active',
+  meshName: 'Group 1', identity: { manufacturer: 'Dell', serial: 'ABC123' }, manual: { location: 'Front office' },
+  network: { observed: { connection: 'wired', switchName: '1 - Ground Floor Main', switchPort: 20, site: 'ABC/Default',
+    mac: 'a8:a1:59:02:f5:78', ip: '192.168.1.112', seenAt: '2026-10-21T19:00:00Z', source: 'unifi-mcp' },
+    resolvedJack: JACK, documentedJack: '', documentedJackInfo: null, knownMacs: ['a8:a1:59:02:f5:78'],
+    issues: [{ kind: 'network-mismatch', message: 'Documented jack 1-01 but seen on 2-14' }] } };
+
+test('mesh_inventory_asset maps a device name to its asset and shows the jack chain and issues', async () => {
+  const { client, call, cleanup } = setup();
+  inventoryPlugin(client, { list: () => ({ assets: [ASSET, { ...ASSET, id: 'inventoryasset/x/a2', nodeid: 'node//lin1', name: 'web01' }] }),
+    get: (cmd) => ({ kind: 'asset', asset: cmd.assetId === ASSET.id ? ASSET : null }) });
+  const r = await call('mesh_inventory_asset', { asset: 'Prudecon-File' });
+  assert.equal(r.isError, false, r.text);
+  assert.match(r.text, /Observed: wired on switch 1 - Ground Floor Main port 20, site ABC\/Default/);
+  assert.match(r.text, /Resolved jack: site ABC\/Default jack 2-14 \(Cashier\) → panel A\/14 → switch 1 - Ground Floor Main port 20/);
+  assert.match(r.text, /ISSUE network-mismatch/);
+  assert.equal(client.raw.find((c) => c.pluginaction === 'get').assetId, ASSET.id);
+  cleanup();
+});
+
+test('mesh_inventory_observe turns a find_client match into a network-observe payload', async () => {
+  const { client, call, cleanup } = setup();
+  let observed;
+  inventoryPlugin(client, { list: () => ({ assets: [ASSET] }), get: () => ({ asset: ASSET }),
+    'network-observe': (cmd) => { observed = cmd; return { kind: 'network-observed', changed: true, moved: true, stale: false, asset: ASSET }; } });
+  const r = await call('mesh_inventory_observe', { asset: 'Prudecon-File', mac: 'a8:a1:59:02:f5:78', ip: '192.168.1.112',
+    site: 'ABC/Default', connection: 'wired', switch: { name: '1 - Ground Floor Main', mac: '74:ac:b9:3e:6c:ea', port: 20 } });
+  assert.equal(r.isError, false, r.text);
+  assert.match(r.text, /recorded: MOVED/);
+  assert.equal(observed.assetId, ASSET.id);
+  assert.deepEqual(
+    { switchName: observed.observation.switchName, switchMac: observed.observation.switchMac, switchPort: observed.observation.switchPort, source: observed.observation.source },
+    { switchName: '1 - Ground Floor Main', switchMac: '74:ac:b9:3e:6c:ea', switchPort: 20, source: 'unifi-mcp' });
+  cleanup();
+});
+
+test('mesh_inventory_netports lists ports; a missing plugin gives a clear error', async () => {
+  const { client, call, cleanup } = setup();
+  inventoryPlugin(client, { 'netport-list': () => ({ netports: [{ ...JACK, observedAssets: [{ id: ASSET.id, name: 'Prudecon-File' }],
+    issues: [{ kind: 'netport-duplicate-switch-port' }] }], sites: ['ABC/Default'] }) });
+  const r = await call('mesh_inventory_netports', { site: 'ABC/Default' });
+  assert.match(r.text, /jack 2-14 .*seen: Prudecon-File \| ISSUES: netport-duplicate-switch-port/);
+  cleanup();
+
+  const s2 = setup();
+  const miss = await s2.call('mesh_inventory_netports', {});
+  assert.equal(miss.isError, true);
+  assert.match(miss.text, /'inventory' plugin did not answer/);
+  s2.cleanup();
+});

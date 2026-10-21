@@ -661,6 +661,26 @@ export function createContext({ server, client, policy, gate, config, audit = ne
     }
   }
 
+  // Server plugin action over the user websocket ({action:'plugin', plugin, pluginaction}).
+  // MeshCentral hands it to the plugin's serveraction as this account, so the plugin's own
+  // permission checks apply. Plugins following the inventory plugin's convention answer with
+  // {action:'plugin', plugin, method, requestId, ok, result, error}; no answer means the
+  // plugin is not installed (MeshCentral drops actions for unknown plugins silently).
+  async function pluginAction(plugin, pluginaction, payload = {}, timeoutMs = 30_000) {
+    const requestId = `mcp_${crypto.randomBytes(6).toString('hex')}`;
+    const reply = client.waitForMessage((m) => m.action === 'plugin' && m.plugin === plugin && m.requestId === requestId, timeoutMs);
+    reply.catch(() => {});
+    await client.sendRaw({ ...payload, action: 'plugin', plugin, pluginaction, requestId });
+    let msg;
+    try {
+      msg = await reply;
+    } catch {
+      throw new Error(`The MeshCentral '${plugin}' plugin did not answer '${pluginaction}' within ${timeoutMs / 1000}s (not installed, disabled, or an older version without this action?)`);
+    }
+    if (!msg.ok) throw new Error(`${plugin} plugin: ${msg.error || 'request failed'}`);
+    return msg.result;
+  }
+
   // Remote registry relay (protocol 4; MeshCentral 1.3.0+, Windows agents).
   async function withRegistryTunnel(idOrName, fn) {
     const ws = await client.openRelay(await resolveNodeId(idOrName), 4);
@@ -719,6 +739,6 @@ export function createContext({ server, client, policy, gate, config, audit = ne
     withStatus, lastConnect, lastConnects, deviceEvents, ago,
     RUN_TYPE_LABEL, readOnlyFor, withProgress, READONLY_AGENT_CONSOLE,
     runShell, startShellJob, waitForJob, cancelJob, jobs, runningJobs, jobFinished, stillRunningMessage,
-    runConsole, processList, withFileTunnel, withRegistryTunnel, serverVersion, versionAtLeast, nativeSoftware, imageResult,
+    runConsole, processList, withFileTunnel, withRegistryTunnel, pluginAction, serverVersion, versionAtLeast, nativeSoftware, imageResult,
   };
 }
