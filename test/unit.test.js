@@ -288,3 +288,25 @@ test('dropBlankSettings: blank or unexpanded plugin settings count as unset', as
   assert.equal(loadConfig(env).credentials.kind, 'username/password');
   assert.match(loadConfig({ ...env, CLAUDE_PLUGIN_DATA: '/data/mesh' }).auditLog, /^\/data\/mesh\/logs\/audit\.jsonl$/);
 });
+
+// ── relay setup retry ───────────────────────────────────────────────────
+test('openRelay re-issues the tunnel request when the agent never connects, without crashing', async () => {
+  const { MeshCentralClient } = await import('../src/mesh-client.js');
+  const { WebSocketServer } = await import('ws');
+  const wss = new WebSocketServer({ port: 0 });
+  let conns = 0;
+  wss.on('connection', (sock) => { if (++conns >= 2) sock.send('c'); }); // the first attempt never pairs
+  const client = new MeshCentralClient({ serverUrl: `http://127.0.0.1:${wss.address().port}/`, username: 'u', password: 'p' });
+  const sent = [];
+  client.sendCommand = async () => ({ cookie: 'k' });
+  client.sendRaw = async (m) => { sent.push(m); };
+  try {
+    const ws = await client.openRelay('node//x', 4, { attemptMs: 300, timeoutMs: 5000 });
+    assert.equal(ws.readyState, 1);
+    assert.equal(sent.filter((m) => m.type === 'tunnel').length, 2, 'tunnel request re-issued once');
+    ws.close();
+  } finally {
+    for (const s of wss.clients) s.terminate();
+    await new Promise((r) => wss.close(r));
+  }
+});

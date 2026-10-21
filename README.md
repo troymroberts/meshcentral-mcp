@@ -255,7 +255,7 @@ MESH_IT=1 MESH_TEST_NODE=<node-id-or-name> npm run test:integration
 
 ## Compatibility note
 
-MeshCentral's native `software` action could crash some older server releases, so `mesh_list_software` only uses it on MeshCentral 1.3.0 and newer. In 1.3.0 the server answers any `software` request that carries a `responseid` with an immediate `Denied`; the server therefore sends it without one and matches the agent's reply by device. Tested against MeshCentral 1.2.5 and 1.3.0.
+MeshCentral's native `software` action could crash some older server releases, so `mesh_list_software` only uses it on MeshCentral 1.3.0 and newer. In 1.3.0 the server answers any `software` request that carries a `responseid` with an immediate `Denied`; the server therefore sends it without one and matches the agent's reply by device. Tested against MeshCentral 1.2.5 and 1.3.0 (software and registry tools verified live on 1.3.0: Windows Server 2022 and Debian 13).
 
 ## Contributing
 
