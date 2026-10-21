@@ -1,6 +1,6 @@
 {
   "name": "meshcentral",
-  "description": "MeshCentral remote support for Claude Code: inventory, diagnostics, commands, terminals, remote desktop, file transfer and chat with the person at a device.",
+  "description": "MeshCentral remote support for Claude Code: inventory, diagnostics, commands, terminals, remote desktop, file transfer, software, Windows registry and chat with the person at a device.",
   "author": { "name": "troymroberts" },
   "homepage": "https://github.com/troymroberts/meshcentral-mcp",
   "repository": "https://github.com/troymroberts/meshcentral-mcp",

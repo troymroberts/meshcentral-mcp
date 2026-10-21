@@ -506,3 +506,178 @@ test('mesh_file_download refuses to overwrite an existing local file', async () 
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+// ── software (native Software tab action) ───────────────────────────────
+
+function withServerVersion(client, current) {
+  const send = client.sendCommand.bind(client);
+  client.sendCommand = async (cmd, t) => (cmd.action === 'serverversion'
+    ? { action: 'serverversion', tags: { current } } : send(cmd, t));
+}
+
+// Answer pushed 'software' requests: replies(cmd) returns the agent's messages in order.
+function softwareAgent(client, replies) {
+  const waiters = [];
+  client.waitForMessage = (match) => new Promise((resolve) => waiters.push({ match, resolve }));
+  client.sendRaw = async (cmd) => {
+    client.raw.push(cmd);
+    for (const value of replies(cmd)) {
+      const msg = { action: 'software', nodeid: cmd.nodeid, value: JSON.stringify(value) };
+      const w = waiters.find((x) => x.match(msg));
+      if (w) { waiters.splice(waiters.indexOf(w), 1); w.resolve(msg); }
+    }
+  };
+}
+
+test('mesh_list_software uses the native inventory on MeshCentral 1.3.0+, without a responseid', async () => {
+  const { client, call, cleanup } = setup();
+  withServerVersion(client, '1.3.0');
+  softwareAgent(client, () => [[
+    { name: 'Zeta Tool', version: '2.0', publisher: 'Zeta', date: '20260101' },
+    { name: 'Alpha App', version: '1.1', publisher: 'Alpha Inc', date: '20251231' },
+  ]]);
+  const r = await call('mesh_list_software', { node_id: 'Prudecon-File' });
+  assert.equal(r.isError, false);
+  assert.match(r.text, /Installed software on Prudecon-File \(2\)/);
+  assert.ok(r.text.indexOf('Alpha App') < r.text.indexOf('Zeta Tool'), 'sorted by name');
+  assert.match(r.text, /2025-12-31/);
+  const req = client.raw.find((c) => c.action === 'software');
+  assert.equal(req.type, 'installedapps');
+  assert.equal(req.responseid, undefined);
+  assert.equal(runs(client).length, 0, 'no shell command when the native inventory answers');
+
+  const f = await call('mesh_list_software', { node_id: 'Prudecon-File', filter: 'zeta' });
+  assert.match(f.text, /\(1 matching "zeta"\)/);
+  assert.doesNotMatch(f.text, /Alpha App/);
+  cleanup();
+});
+
+test('mesh_list_software keeps the shell inventory on servers older than 1.3.0', async () => {
+  const { client, call, cleanup } = setup();
+  withServerVersion(client, '1.2.5');
+  client.run = async () => 'DisplayName DisplayVersion\n7-Zip 24.08';
+  const r = await call('mesh_list_software', { node_id: 'Prudecon-File' });
+  assert.match(r.text, /7-Zip/);
+  assert.match(r.text, /older than 1\.3\.0/);
+  assert.equal(client.raw.filter((c) => c.action === 'software').length, 0);
+  cleanup();
+});
+
+test('mesh_uninstall_software waits for the exit code, not the "started" notice', async () => {
+  const { client, call, cleanup } = setup();
+  withServerVersion(client, '1.3.0');
+  softwareAgent(client, (cmd) => cmd.type === 'installedapps'
+    ? [[{ name: '7-Zip 24.08 (x64)', version: '24.08', uninstall: '"C:\\Program Files\\7-Zip\\Uninstall.exe" /S' }]]
+    : [{ status: 'Silent uninstall started' }, { success: true, exitCode: 0 }]);
+  const r = await call('mesh_uninstall_software', { purpose: 'test', node_id: 'Prudecon-File', name: '7-Zip 24.08 (x64)' });
+  assert.equal(r.isError, false, r.text);
+  assert.match(r.text, /exit code 0/);
+  const un = client.raw.find((c) => c.type === 'uninstallapp');
+  assert.equal(Buffer.from(un.value, 'base64').toString(), '"C:\\Program Files\\7-Zip\\Uninstall.exe" /S');
+
+  const miss = await call('mesh_uninstall_software', { purpose: 'test', node_id: 'Prudecon-File', name: '7-Zip' });
+  assert.match(miss.text, /No installed program named exactly/);
+  cleanup();
+});
+
+// ── registry (remote registry relay, protocol 4) ────────────────────────
+
+import { EventEmitter } from 'node:events';
+import { parseRegistryPath, RegistryTunnel } from '../src/registry-tunnel.js';
+
+class FakeRelay extends EventEmitter {
+  readyState = 1;
+  sent = [];
+  constructor(answer) { super(); this.answer = answer; }
+  send(text) {
+    const cmd = JSON.parse(text);
+    this.sent.push(cmd);
+    const reply = this.answer(cmd);
+    if (reply) setImmediate(() => this.emit('message', Buffer.from(JSON.stringify({ action: cmd.action, reqid: cmd.reqid, ...reply }))));
+  }
+  close() { this.readyState = 3; this.emit('close'); }
+}
+
+test('parseRegistryPath accepts short, long and PowerShell hive forms', () => {
+  assert.deepEqual(parseRegistryPath('HKLM\\SOFTWARE\\Microsoft'), { hive: 'HKEY_LOCAL_MACHINE', path: 'SOFTWARE\\Microsoft' });
+  assert.deepEqual(parseRegistryPath('HKCU:\\Software\\X\\'), { hive: 'HKEY_CURRENT_USER', path: 'Software\\X' });
+  assert.deepEqual(parseRegistryPath('hkey_users/S-1-5-18'), { hive: 'HKEY_USERS', path: 'S-1-5-18' });
+  assert.deepEqual(parseRegistryPath('HKLM'), { hive: 'HKEY_LOCAL_MACHINE', path: '' });
+  assert.throws(() => parseRegistryPath('HKXX\\Foo'), /Unknown registry hive/);
+  assert.throws(() => parseRegistryPath(''), /required/);
+});
+
+test('RegistryTunnel matches replies by reqid, surfaces agent errors and fails pending calls on close', async () => {
+  const ws = new FakeRelay((cmd) => cmd.action === 'list'
+    ? { subkeys: ['A'], values: [{ name: 'V', type: 'REG_SZ', value: 'x' }] }
+    : cmd.action === 'setvalue' ? { error: 'Access is denied.' } : null);
+  const t = new RegistryTunnel(ws);
+  const listed = await t.list('HKEY_LOCAL_MACHINE', 'SOFTWARE\\X');
+  assert.deepEqual(listed.subkeys, ['A']);
+  await assert.rejects(t.setValue('HKEY_LOCAL_MACHINE', 'SOFTWARE\\X', 'V', 'REG_SZ', 'y'), /Access is denied/);
+  const pending = t.export('HKEY_LOCAL_MACHINE', 'SOFTWARE\\X');
+  ws.close();
+  await assert.rejects(pending, /Registry tunnel closed/);
+});
+
+function registryRelay(client, answer) {
+  const relays = [];
+  client.openRelay = async (nodeid, protocol) => {
+    const ws = new FakeRelay(answer);
+    relays.push({ nodeid, protocol, ws });
+    return ws;
+  };
+  return relays;
+}
+
+test('mesh_registry_list opens protocol 4, filters and fences device output', async () => {
+  const { client, call, cleanup } = setup();
+  const relays = registryRelay(client, (cmd) => ({
+    subkeys: ['Policies', 'Microsoft', 'Classes'],
+    values: [{ name: 'ProductName', type: 'REG_SZ', value: 'Windows Server 2022' }, { name: 'Other', type: 'REG_DWORD', value: '1' }],
+  }));
+  const r = await call('mesh_registry_list', { node_id: 'Prudecon-File', key: 'HKLM\\SOFTWARE', filter: 'product' });
+  assert.equal(r.isError, false, r.text);
+  assert.equal(relays[0].protocol, 4);
+  assert.deepEqual({ hive: relays[0].ws.sent[0].hive, path: relays[0].ws.sent[0].path }, { hive: 'HKEY_LOCAL_MACHINE', path: 'SOFTWARE' });
+  assert.match(r.text, /ProductName \| REG_SZ \| Windows Server 2022/);
+  assert.doesNotMatch(r.text, /Other/);
+  assert.match(r.text, /DEVICE_OUTPUT/);
+  assert.equal(relays[0].ws.readyState, 3, 'tunnel closed after the call');
+
+  const lin = await call('mesh_registry_list', { node_id: 'web01', key: 'HKLM\\SOFTWARE' });
+  assert.match(lin.text, /not a Windows device/);
+  cleanup();
+});
+
+test('registry writes refuse keys at or just under a hive root', async () => {
+  const { client, call, cleanup } = setup();
+  const relays = registryRelay(client, () => ({ success: true }));
+  for (const [tool, args] of [
+    ['mesh_registry_delete', { key: 'HKLM\\SOFTWARE' }],
+    ['mesh_registry_set_value', { key: 'HKLM\\SYSTEM', name: 'x', type: 'REG_SZ', data: 'y' }],
+    ['mesh_registry_rename', { key: 'HKCU\\Software', new_name: 'z' }],
+  ]) {
+    const r = await call(tool, { purpose: 'test', node_id: 'Prudecon-File', ...args });
+    assert.equal(r.isError, true, tool);
+    assert.match(r.text, /too close to the hive root/);
+  }
+  assert.equal(relays.length, 0, 'nothing was sent');
+
+  const ok = await call('mesh_registry_delete', { purpose: 'test', node_id: 'Prudecon-File', key: 'HKLM\\SOFTWARE\\Vendor\\Old' });
+  assert.equal(ok.isError, false, ok.text);
+  assert.deepEqual(relays[0].ws.sent[0].items, [{ kind: 'key', hive: 'HKEY_LOCAL_MACHINE', path: 'SOFTWARE\\Vendor', name: 'Old' }]);
+  cleanup();
+});
+
+test('registry writes on Mesh Agent keys are blocked by the agent guard', async () => {
+  const { client, call, cleanup } = setup();
+  const relays = registryRelay(client, () => ({ success: true }));
+  const r = await call('mesh_registry_set_value', {
+    purpose: 'test', node_id: 'Prudecon-File', key: 'HKLM\\SYSTEM\\CurrentControlSet\\Services\\Mesh Agent', name: 'Start', type: 'REG_DWORD', data: '4',
+  });
+  assert.equal(r.isError, true);
+  assert.match(r.text, /BLOCKED/);
+  assert.equal(relays.length, 0);
+  cleanup();
+});

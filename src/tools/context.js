@@ -1,6 +1,7 @@
 import crypto from 'crypto';
 import { z } from 'zod';
 import { FileTunnel } from '../file-tunnel.js';
+import { RegistryTunnel } from '../registry-tunnel.js';
 import { TerminalManager } from '../terminal.js';
 import { DesktopManager } from '../desktop.js';
 import { ChatManager } from '../chat.js';
@@ -660,12 +661,64 @@ export function createContext({ server, client, policy, gate, config, audit = ne
     }
   }
 
+  // Remote registry relay (protocol 4; MeshCentral 1.3.0+, Windows agents).
+  async function withRegistryTunnel(idOrName, fn) {
+    const ws = await client.openRelay(await resolveNodeId(idOrName), 4);
+    const tunnel = new RegistryTunnel(ws);
+    try {
+      return await fn(tunnel);
+    } finally {
+      tunnel.close();
+    }
+  }
+
+  // MeshCentral server version as [major, minor, patch], cached for the session;
+  // null when the server does not say.
+  let serverVersionCache;
+  async function serverVersion() {
+    if (serverVersionCache !== undefined) return serverVersionCache;
+    try {
+      const res = await client.sendCommand({ action: 'serverversion' }, 10_000);
+      const m = /^(\d+)\.(\d+)\.(\d+)/.exec(res?.tags?.current ?? '');
+      serverVersionCache = m ? m.slice(1).map(Number) : null;
+    } catch { serverVersionCache = null; }
+    return serverVersionCache;
+  }
+  const versionAtLeast = (v, min) => Boolean(v) && (v[0] - min[0] || v[1] - min[1] || v[2] - min[2]) >= 0;
+
+  // MeshCentral's native 'software' action (the Software tab): type 'installedapps',
+  // 'installedstoreapps' or 'uninstallapp'. The agent answers with a separate
+  // 'software' message. Sent without a responseid: MeshCentral 1.3.0 answers any
+  // 'software' request carrying a responseid with an immediate 'Denied'.
+  // accept(data) picks the reply to wait for when the agent sends several
+  // (an uninstall first reports 'started', then the exit code).
+  const parseSoftwareValue = (msg) => {
+    let data = msg.value;
+    if (typeof data === 'string') { try { data = JSON.parse(data); } catch { /* plain text */ } }
+    return data;
+  };
+  async function nativeSoftware(nodeId, type, value, timeoutMs = 120_000, accept = null) {
+    const reply = client.waitForMessage((m) => {
+      if (m.action !== 'software' || (m.nodeid != null && m.nodeid !== nodeId)) return false;
+      if (typeof m.result === 'string' && m.value == null) return true; // server refusal ('Denied', 'Agent offline')
+      const data = parseSoftwareValue(m);
+      return !accept || Boolean(data?.error) || accept(data);
+    }, timeoutMs);
+    reply.catch(() => {});
+    await client.sendRaw({ action: 'software', nodeid: nodeId, type, ...(value != null ? { value } : {}) });
+    const msg = await reply;
+    if (typeof msg.result === 'string' && msg.value == null) throw new Error(`MeshCentral: ${msg.result}`);
+    const data = parseSoftwareValue(msg);
+    if (data && !Array.isArray(data) && data.error) throw new Error(String(data.error));
+    return data;
+  }
+
   return {
     server, client, policy, gate, config, audit, registered, known, terminals, desktops, chats, define, diagnosticsText,
     meshId, allNodes, allMeshes, humanizeIds, getNode, requireNode, resolveNodeId, resolveNodeIds, isWindowsNode,
     withStatus, lastConnect, lastConnects, deviceEvents, ago,
     RUN_TYPE_LABEL, readOnlyFor, withProgress, READONLY_AGENT_CONSOLE,
     runShell, startShellJob, waitForJob, cancelJob, jobs, runningJobs, jobFinished, stillRunningMessage,
-    runConsole, processList, withFileTunnel, imageResult,
+    runConsole, processList, withFileTunnel, withRegistryTunnel, serverVersion, versionAtLeast, nativeSoftware, imageResult,
   };
 }
