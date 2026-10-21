@@ -5,6 +5,7 @@ import { RegistryTunnel } from '../registry-tunnel.js';
 import { TerminalManager } from '../terminal.js';
 import { DesktopManager } from '../desktop.js';
 import { ChatManager } from '../chat.js';
+import { PortForwardManager } from '../port-forward.js';
 import { isReadOnlyCommand } from '../readonly.js';
 import { sanitizeText, errorResult, isServerError, deviceResult, UNTRUSTED_NOTE } from '../safety.js';
 import { AGENT_GUARD_MESSAGE } from '../agent-guard.js';
@@ -80,6 +81,7 @@ export function createContext({ server, client, policy, gate, config, audit = ne
     server.server.notification({ method: 'notifications/claude/channel', params: { content, meta } }).catch(() => {});
   };
   const chats = new ChatManager({ client, idleMinutes: config.chatIdleMinutes ?? 30, onEvent: pushChatEvent });
+  const portForwards = new PortForwardManager({ client, idleMinutes: config.portForwardIdleMinutes ?? 30, maxForwards: config.portForwardMax ?? 5 });
 
   const registered = [];
   const known = []; // every tool name, registered or not (to catch typos in ENABLE/DISABLE_TOOLS)
@@ -714,7 +716,7 @@ export function createContext({ server, client, policy, gate, config, audit = ne
   }
 
   return {
-    server, client, policy, gate, config, audit, registered, known, terminals, desktops, chats, define, diagnosticsText,
+    server, client, policy, gate, config, audit, registered, known, terminals, desktops, chats, portForwards, define, diagnosticsText,
     meshId, allNodes, allMeshes, humanizeIds, getNode, requireNode, resolveNodeId, resolveNodeIds, isWindowsNode,
     withStatus, lastConnect, lastConnects, deviceEvents, ago,
     RUN_TYPE_LABEL, readOnlyFor, withProgress, READONLY_AGENT_CONSOLE,
