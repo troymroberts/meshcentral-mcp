@@ -358,12 +358,25 @@ export class MeshCentralClient {
   // device); a fresh request with a new id then connects normally. So each attempt
   // waits attemptMs and the request is re-issued, up to `attempts` times.
   async openRelay(nodeid, protocol, { options = null, timeoutMs = 25_000, attempts = 3, attemptMs = 8_000 } = {}) {
+    return this.#withRetries((wait) => this.#openRelayOnce(nodeid, protocol, options, null, wait), { timeoutMs, attempts, attemptMs });
+  }
+
+  // TCP port forward through the agent (what MeshCentral Router and the HTTP links
+  // use): the server checks the remote-control/relay right and asks the agent to
+  // connect to host:port on its network, then the relay carries raw bytes as binary
+  // frames. Resolves once the relay is paired; a target the agent cannot reach shows
+  // up as the socket closing right after.
+  async openTcpRelay(nodeid, host, port, { timeoutMs = 25_000, attempts = 3, attemptMs = 8_000 } = {}) {
+    return this.#withRetries((wait) => this.#openRelayOnce(nodeid, null, null, { host, port }, wait), { timeoutMs, attempts, attemptMs });
+  }
+
+  async #withRetries(once, { timeoutMs, attempts, attemptMs }) {
     const deadline = Date.now() + timeoutMs;
     let lastError;
     for (let i = 0; i < attempts && Date.now() < deadline; i++) {
       const wait = i === attempts - 1 ? deadline - Date.now() : Math.min(attemptMs, deadline - Date.now());
       try {
-        return await this.#openRelayOnce(nodeid, protocol, options, wait);
+        return await once(wait);
       } catch (err) {
         lastError = err;
         if (!err.retryable) throw err;
@@ -372,15 +385,21 @@ export class MeshCentralClient {
     throw lastError ?? new Error('Tunnel setup timed out (is the device online and its agent connected?)');
   }
 
-  async #openRelayOnce(nodeid, protocol, options, timeoutMs) {
+  async #openRelayOnce(nodeid, protocol, options, tcp, timeoutMs) {
     const cookieResp = await this.sendCommand({ action: 'getcookie', nodeid }, 15_000);
     if (!cookieResp.cookie) throw new Error('Server did not return a tunnel auth cookie (unknown device or no access?)');
 
     // nodeid and cookie are passed raw: the agent escapes '$'/'@' itself, and '*/'
-    // tells it to resolve the path against its own server URL.
+    // tells it to resolve the path against its own server URL. For a TCP forward the
+    // server sends the agent its tunnel request itself (with tcpaddr/tcpport).
     const tunnelId = crypto.randomBytes(16).toString('hex');
-    const query = `p=${protocol}&nodeid=${nodeid}&id=${tunnelId}&auth=${cookieResp.cookie}`;
-    await this.sendRaw({ action: 'msg', type: 'tunnel', nodeid, value: `*/meshrelay.ashx?${query}` });
+    let query;
+    if (tcp) {
+      query = `nodeid=${nodeid}&tcpport=${Number(tcp.port)}&tcpaddr=${encodeURIComponent(tcp.host)}&id=${tunnelId}&auth=${cookieResp.cookie}`;
+    } else {
+      query = `p=${protocol}&nodeid=${nodeid}&id=${tunnelId}&auth=${cookieResp.cookie}`;
+      await this.sendRaw({ action: 'msg', type: 'tunnel', nodeid, value: `*/meshrelay.ashx?${query}` });
+    }
 
     const ws = new WebSocket(endpointUrl(this.#config.serverUrl, 'meshrelay.ashx', query), this.#wsOptions());
 
@@ -403,8 +422,10 @@ export class MeshCentralClient {
         const s = data.toString();
         if (s !== 'c' && s !== 'cr') return;
         cleanup();
-        if (options) ws.send(JSON.stringify({ ctrlChannel: '102938', type: 'options', ...options }));
-        ws.send(String(protocol));
+        if (!tcp) {
+          if (options) ws.send(JSON.stringify({ ctrlChannel: '102938', type: 'options', ...options }));
+          ws.send(String(protocol));
+        }
         resolve();
       };
       const onError = (err) => { cleanup(); ws.on('error', () => {}); reject(new Error(`Tunnel error: ${err.message}`)); };

@@ -16,6 +16,7 @@ A Model Context Protocol (MCP) server that lets AI assistants operate your MeshC
 - Power actions, Wake-on-LAN, toasts, process list/kill
 - **Software inventory and uninstall** — the MeshCentral Software tab (programs, Store apps, Linux packages)
 - **Windows registry** — list, export, set, create, delete and rename over MeshCentral's remote registry relay (the Registry tab)
+- **LAN web devices through an agent** — HTTP(S) requests with Basic/Digest auth and local named credentials, and local port forwards for a browser (NVRs/cameras, printers, switches, UPS cards, iDRAC/iLO)
 - User / group / permission administration, agent lifecycle, server console
 - **Login-token authentication** so you never store a real password
 - **Local file jail** so file tools cannot read `.env`, SSH keys, or escape their directory
@@ -210,8 +211,8 @@ Image encoding is pinned to **JPEG** (the tile decoder is JPEG-only); a non-JPEG
 
 Each tool carries a capability **tier** (shown in its description). Tiers: **R** read, **RF** remote data read, **W** light write, **X** execution, **WF** remote file write, **P** disruptive/lifecycle, **A** administration.
 
-- **R** — `mesh_server_info`, `mesh_list_devices`, `mesh_get_device`, `mesh_device_history`, `mesh_activity`, `mesh_list_groups`, `mesh_list_users`, `mesh_list_user_groups`, `mesh_get_events`, `mesh_get_notes`, `mesh_get_lastconnects`, `mesh_get_power_timeline`, `mesh_get_sysinfo`, `mesh_get_network_info`, `mesh_list_share_links`, `mesh_chat_list`, `mesh_chat_diagnostics`, `mesh_server_version`, `mesh_server_stats`, `mesh_traffic_stats`, `mesh_server_errors`, `mesh_terminal_read`, `mesh_terminal_list`, `mesh_desktop_list`
-- **RF** — `mesh_list_processes`, `mesh_chat_read`, `mesh_health_check`, `mesh_event_log`, `mesh_services`, `mesh_job_status`, `mesh_get_device_info`, `mesh_list_software`, `mesh_registry_list`, `mesh_registry_export`, `mesh_get_clipboard`, `mesh_file_list`, `mesh_file_read`, `mesh_file_download`, `mesh_file_find`, `mesh_desktop_screenshot`
+- **R** — `mesh_server_info`, `mesh_list_devices`, `mesh_get_device`, `mesh_device_history`, `mesh_activity`, `mesh_list_groups`, `mesh_list_users`, `mesh_list_user_groups`, `mesh_get_events`, `mesh_get_notes`, `mesh_get_lastconnects`, `mesh_get_power_timeline`, `mesh_get_sysinfo`, `mesh_get_network_info`, `mesh_list_share_links`, `mesh_chat_list`, `mesh_chat_diagnostics`, `mesh_server_version`, `mesh_server_stats`, `mesh_traffic_stats`, `mesh_server_errors`, `mesh_terminal_read`, `mesh_terminal_list`, `mesh_desktop_list`, `mesh_port_forward_list`, `mesh_port_forward_close`
+- **RF** — `mesh_list_processes`, `mesh_chat_read`, `mesh_health_check`, `mesh_event_log`, `mesh_services`, `mesh_job_status`, `mesh_get_device_info`, `mesh_list_software`, `mesh_registry_list`, `mesh_registry_export`, `mesh_http_request`, `mesh_port_forward`, `mesh_get_clipboard`, `mesh_file_list`, `mesh_file_read`, `mesh_file_download`, `mesh_file_find`, `mesh_desktop_screenshot`
 - **W** — `mesh_set_notes`, `mesh_log_event`, `mesh_job_cancel`, `mesh_edit_device`, `mesh_create_group`, `mesh_edit_group`, `mesh_send_toast`, `mesh_message_box`, `mesh_open_url`, `mesh_chat_open`, `mesh_chat_send`, `mesh_chat_close`, `mesh_remove_share_link`, `mesh_wake_devices`, `mesh_set_clipboard`, `mesh_file_mkdir`
 - **X** — `mesh_run_command`, `mesh_agent_console`, `mesh_uninstall_software`, `mesh_terminal_open`, `mesh_terminal_input`, `mesh_terminal_close`, `mesh_desktop_open`, `mesh_desktop_click`, `mesh_desktop_move`, `mesh_desktop_type`, `mesh_desktop_key`, `mesh_desktop_hotkey`, `mesh_desktop_scroll`, `mesh_desktop_set_display`, `mesh_desktop_close` (`mesh_desktop_list` is R)
 - **WF** — `mesh_file_write`, `mesh_file_upload`, `mesh_file_delete`, `mesh_file_rename`, `mesh_file_copy`, `mesh_file_move`, `mesh_registry_set_value`, `mesh_registry_create_key`, `mesh_registry_delete`, `mesh_registry_rename`
@@ -252,6 +253,21 @@ MESH_IT=1 MESH_TEST_NODE=<node-id-or-name> npm run test:integration
 
 - **Software.** `mesh_list_software` uses MeshCentral's native Software-tab inventory on MeshCentral **1.3.0+**: Windows machine-wide programs (HKLM uninstall keys; per-user installs are not listed) or, with `store_apps`, Store/AppX packages; Linux dpkg/rpm/apk/flatpak/snap packages. `filter` narrows by name or publisher. On older servers, or if the native call fails, it falls back to a read-only inventory command and says why. `mesh_uninstall_software` (tier X, always asks, needs a `purpose`) uninstalls a Windows program by its exact name using the program's registered uninstall command and reports the exit code (3010 = reboot required); Store apps are not supported.
 - **Registry** (Windows, MeshCentral 1.3.0+, needs the remote-control right). Keys are written `HKLM\SOFTWARE\...` (also `HKCU`, `HKU`, `HKCR`, `HKCC`, full `HKEY_` names or `HKLM:\`). `mesh_registry_list` shows subkeys and values (omit `key` for the hives; the agent looks up each value's type separately, so use `filter` on large keys); `mesh_registry_export` returns `.reg` text or saves it with `local_path`. Changes are tier WF and need a `purpose`: `mesh_registry_set_value` (REG_SZ, REG_EXPAND_SZ, REG_MULTI_SZ, REG_DWORD/QWORD as decimal or `0x` hex, REG_BINARY, REG_NONE), `mesh_registry_create_key`, `mesh_registry_delete` (a value, or a key with everything under it; always asks) and `mesh_registry_rename`. Writes refuse a hive or a key directly under it (`HKLM\SOFTWARE`, `HKLM\SYSTEM`, ...), and keys that look like the Mesh Agent's own are blocked by the agent guard. If the device group asks for user consent for remote registry, the user at the device is prompted.
+
+## LAN web devices (HTTP through an agent)
+
+MeshCentral can relay a TCP connection through an agent to any address on that agent's network (what MeshCentral Router and the device HTTP links use; the account needs the remote-control or relay right on the device). Two tools build on it:
+
+- **`mesh_http_request`** (RF, needs a `purpose`) sends one HTTP or HTTPS request, e.g. `node_id: "BSL-PC", url: "http://192.168.20.10/cgi-bin/magicBox.cgi?action=getSystemInfo", credential: "bsl-nvr"`. It answers **Basic** and **Digest** challenges (MD5/SHA-256, `-sess`, `qop=auth`) and remembers the Digest challenge per target for the session, so later calls take one round trip. Responses show status, headers (cookie values elided) and the body; `image/*` bodies come back as images, other binary bodies need `save_to` (inside the local file root). A response still streaming at `timeout_seconds` (event long-polls, MJPEG) is returned as partial. HTTPS certificates are not verified unless `verify_tls` (LAN devices are self-signed); the certificate subject/issuer/expiry is shown. Redirects are not followed. Methods other than GET/HEAD/OPTIONS, and URLs that look like a change (`set`, `reboot`, `delete`, `factory`, `upgrade`... in the path or query, as many embedded APIs change state on a GET), ask for approval.
+- **`mesh_port_forward`** (RF, always asks) opens `127.0.0.1:<port>` locally and relays every connection to `host:port` through the agent, like MeshCentral Router. Point a browser (Playwright: ignore HTTPS errors) or any local client at it. Any local process can use the port while it is open; it closes after `MESH_PORT_FORWARD_IDLE_MINUTES` (default 30) idle or with `mesh_port_forward_close`; at most `MESH_PORT_FORWARD_MAX` (default 5) at once; `mesh_port_forward_list` shows them. Web UIs that redirect to their own absolute address or check the Host header may misbehave through it.
+
+**Credentials** never go through tool arguments: `MESH_HTTP_CREDENTIALS` names a local JSON file (keep it out of git; read on each use):
+
+```json
+{ "bsl-nvr": { "username": "api-reader", "password": "...", "hosts": ["192.168.20.0/24"] } }
+```
+
+`hosts` (optional; IPs, host names or IPv4 CIDRs) limits where a credential may be sent. `Authorization`, `Host` and `Connection` headers cannot be passed by hand. Use a least-privilege account on the device; repeated failed logins can lock accounts on embedded devices (Dahua, Hikvision).
 
 ## Compatibility note
 
