@@ -210,9 +210,9 @@ Image encoding is pinned to **JPEG** (the tile decoder is JPEG-only); a non-JPEG
 
 Each tool carries a capability **tier** (shown in its description). Tiers: **R** read, **RF** remote data read, **W** light write, **X** execution, **WF** remote file write, **P** disruptive/lifecycle, **A** administration.
 
-- **R** — `mesh_server_info`, `mesh_list_devices`, `mesh_get_device`, `mesh_device_history`, `mesh_activity`, `mesh_list_groups`, `mesh_list_users`, `mesh_list_user_groups`, `mesh_get_events`, `mesh_get_notes`, `mesh_get_lastconnects`, `mesh_get_power_timeline`, `mesh_get_sysinfo`, `mesh_get_network_info`, `mesh_list_share_links`, `mesh_chat_list`, `mesh_chat_diagnostics`, `mesh_server_version`, `mesh_server_stats`, `mesh_traffic_stats`, `mesh_server_errors`, `mesh_terminal_read`, `mesh_terminal_list`, `mesh_desktop_list`
+- **R** — `mesh_inventory_asset`, `mesh_inventory_netports`, `mesh_server_info`, `mesh_list_devices`, `mesh_get_device`, `mesh_device_history`, `mesh_activity`, `mesh_list_groups`, `mesh_list_users`, `mesh_list_user_groups`, `mesh_get_events`, `mesh_get_notes`, `mesh_get_lastconnects`, `mesh_get_power_timeline`, `mesh_get_sysinfo`, `mesh_get_network_info`, `mesh_list_share_links`, `mesh_chat_list`, `mesh_chat_diagnostics`, `mesh_server_version`, `mesh_server_stats`, `mesh_traffic_stats`, `mesh_server_errors`, `mesh_terminal_read`, `mesh_terminal_list`, `mesh_desktop_list`
 - **RF** — `mesh_list_processes`, `mesh_chat_read`, `mesh_health_check`, `mesh_event_log`, `mesh_services`, `mesh_job_status`, `mesh_get_device_info`, `mesh_list_software`, `mesh_registry_list`, `mesh_registry_export`, `mesh_get_clipboard`, `mesh_file_list`, `mesh_file_read`, `mesh_file_download`, `mesh_file_find`, `mesh_desktop_screenshot`
-- **W** — `mesh_set_notes`, `mesh_log_event`, `mesh_job_cancel`, `mesh_edit_device`, `mesh_create_group`, `mesh_edit_group`, `mesh_send_toast`, `mesh_message_box`, `mesh_open_url`, `mesh_chat_open`, `mesh_chat_send`, `mesh_chat_close`, `mesh_remove_share_link`, `mesh_wake_devices`, `mesh_set_clipboard`, `mesh_file_mkdir`
+- **W** — `mesh_inventory_observe`, `mesh_set_notes`, `mesh_log_event`, `mesh_job_cancel`, `mesh_edit_device`, `mesh_create_group`, `mesh_edit_group`, `mesh_send_toast`, `mesh_message_box`, `mesh_open_url`, `mesh_chat_open`, `mesh_chat_send`, `mesh_chat_close`, `mesh_remove_share_link`, `mesh_wake_devices`, `mesh_set_clipboard`, `mesh_file_mkdir`
 - **X** — `mesh_run_command`, `mesh_agent_console`, `mesh_uninstall_software`, `mesh_terminal_open`, `mesh_terminal_input`, `mesh_terminal_close`, `mesh_desktop_open`, `mesh_desktop_click`, `mesh_desktop_move`, `mesh_desktop_type`, `mesh_desktop_key`, `mesh_desktop_hotkey`, `mesh_desktop_scroll`, `mesh_desktop_set_display`, `mesh_desktop_close` (`mesh_desktop_list` is R)
 - **WF** — `mesh_file_write`, `mesh_file_upload`, `mesh_file_delete`, `mesh_file_rename`, `mesh_file_copy`, `mesh_file_move`, `mesh_registry_set_value`, `mesh_registry_create_key`, `mesh_registry_delete`, `mesh_registry_rename`
 - **P** — `mesh_power_action`, `mesh_kill_process`, `mesh_service_action`, `mesh_remove_device`, `mesh_uninstall_agent`, `mesh_distribute_core`, `mesh_update_agents`, `mesh_delete_group`
@@ -252,6 +252,23 @@ MESH_IT=1 MESH_TEST_NODE=<node-id-or-name> npm run test:integration
 
 - **Software.** `mesh_list_software` uses MeshCentral's native Software-tab inventory on MeshCentral **1.3.0+**: Windows machine-wide programs (HKLM uninstall keys; per-user installs are not listed) or, with `store_apps`, Store/AppX packages; Linux dpkg/rpm/apk/flatpak/snap packages. `filter` narrows by name or publisher. On older servers, or if the native call fails, it falls back to a read-only inventory command and says why. `mesh_uninstall_software` (tier X, always asks, needs a `purpose`) uninstalls a Windows program by its exact name using the program's registered uninstall command and reports the exit code (3010 = reboot required); Store apps are not supported.
 - **Registry** (Windows, MeshCentral 1.3.0+, needs the remote-control right). Keys are written `HKLM\SOFTWARE\...` (also `HKCU`, `HKU`, `HKCR`, `HKCC`, full `HKEY_` names or `HKLM:\`). `mesh_registry_list` shows subkeys and values (omit `key` for the hives; the agent looks up each value's type separately, so use `filter` on large keys); `mesh_registry_export` returns `.reg` text or saves it with `local_path`. Changes are tier WF and need a `purpose`: `mesh_registry_set_value` (REG_SZ, REG_EXPAND_SZ, REG_MULTI_SZ, REG_DWORD/QWORD as decimal or `0x` hex, REG_BINARY, REG_NONE), `mesh_registry_create_key`, `mesh_registry_delete` (a value, or a key with everything under it; always asks) and `mesh_registry_rename`. Writes refuse a hive or a key directly under it (`HKLM\SOFTWARE`, `HKLM\SYSTEM`, ...), and keys that look like the Mesh Agent's own are blocked by the agent guard. If the device group asks for user consent for remote registry, the user at the device is prompted.
+
+## Inventory plugin: where is a machine plugged in?
+
+With the [MeshCentral Inventory plugin](https://github.com/troymroberts/meshcentral-inventory) (1.4.2.2+) installed
+and this account granted its View (and, for `mesh_inventory_observe`, Manage) permission:
+
+- `mesh_inventory_asset` — a device's inventory record: status, assignment, location, warranty, and its network
+  view: last observed site + switch/port (or AP + SSID), the resolved **wall jack → patch panel → switch port**
+  chain, the documented jack, and issues (undocumented port, moved since documented, duplicate port claims).
+- `mesh_inventory_observe` — record a sighting, typically one match from the UniFi MCP's `find_client`
+  (`switch {name, mac, port}` / `access_point {name, mac, ssid}`). The plugin adds a history entry when the device
+  moved and ignores sightings older than the stored one.
+- `mesh_inventory_netports` — the documented network ports (jacks), filterable by site or text.
+
+Typical flow: `mesh_inventory_asset` (observed site = hint) → UniFi `find_client(macs, console/site hint)` →
+`mesh_inventory_observe`. Calls travel as `{action:'plugin', plugin:'inventory', pluginaction, requestId}` on this
+server's own MeshCentral session; a plugin that is not installed simply never answers, which the tools report.
 
 ## Compatibility note
 
