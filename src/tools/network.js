@@ -12,13 +12,33 @@ import { RelaySocket, parseTarget, loadCredential, httpRequest, DigestCache, isT
 export default function register(ctx) {
   const { define, client, config, requireNode, portForwards } = ctx;
   const digestCache = new DigestCache();
+  // One request at a time per target: embedded devices (Dahua) share one Digest
+  // challenge per client, and parallel requests get 401s that look like a bad password.
+  const targetQueues = new Map();
+  const serialized = (key, fn) => {
+    const prev = targetQueues.get(key) ?? Promise.resolve();
+    const run = prev.catch(() => {}).then(fn);
+    targetQueues.set(key, run.finally(() => { if (targetQueues.get(key) === run) targetQueues.delete(key); }).catch(() => {}));
+    return run;
+  };
+  // Lockout guard: devices lock an account after a few failed logins (Dahua: ~5, then
+  // minutes; across HTTP, RTSP and SDK). Refuse a credential on a target after 2
+  // rejections in 10 minutes rather than risk locking it out.
+  const AUTH_FAIL_LIMIT = 2;
+  const AUTH_FAIL_WINDOW_MS = 10 * 60_000;
+  const authFailures = new Map(); // key -> [timestamps]
+  const recentFailures = (key) => (authFailures.get(key) ?? []).filter((t) => Date.now() - t < AUTH_FAIL_WINDOW_MS);
 
   const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
   // Many embedded web APIs change state on a GET (Dahua configManager.cgi?action=setConfig,
   // magicBox.cgi?action=reboot, ...): such URLs ask like a POST would.
-  const CHANGE_WORDS = /(set|reboot|restart|reset|factory|delete|remove|upgrade|update|modify|add|shutdown|format|apply|save|write|enable|disable)/i;
+  const CHANGE_WORDS = /(set|reboot|restart|reset|factory|delete|remove|upgrade|update|modify|add|shutdown|format|apply|save|write|enable|disable|clear)/i;
   const looksLikeChange = (url) => {
-    try { const u = new URL(url); return CHANGE_WORDS.test(`${u.pathname}${u.search}`.replace(/getconfig|getdefault|getcaps/gi, '')); } catch { return false; }
+    try {
+      const u = new URL(url);
+      const s = `${u.pathname}${u.search}`;
+      return CHANGE_WORDS.test(s.replace(/getconfig|getdefault|getcaps/gi, '')) || /ptz\.cgi[^#]*action=(start|stop)/i.test(s);
+    } catch { return false; }
   };
 
   const BINARY_IMAGE_MAX = 4 * 1024 * 1024;
@@ -65,8 +85,12 @@ export default function register(ctx) {
       const cred = credential ? loadCredential(config.httpCredentialsFile, credential, target.host) : null;
       const dest = save_to ? resolveLocalPath(save_to, { mustExist: false }) : null;
 
+      const authKey = `${node._id}|${target.host}|${target.port}|${credential ?? ''}`;
+      if (credential && recentFailures(authKey).length >= AUTH_FAIL_LIMIT) {
+        return errorResult(`Credential "${credential}" was rejected ${AUTH_FAIL_LIMIT} times by ${target.host} in the last 10 minutes; not trying again (account lockout risk). Check the credentials file, then retry later.`);
+      }
       const started = Date.now();
-      const res = await httpRequest(
+      const res = await serialized(`${node._id}|${target.host}|${target.port}`, () => httpRequest(
         async () => new RelaySocket(await client.openTcpRelay(node._id, target.host, target.port)),
         target,
         {
@@ -74,7 +98,9 @@ export default function register(ctx) {
           cache: digestCache, cacheKey: `${node._id}|${target.host}|${target.port}|${credential ?? ''}`,
           timeoutMs: (timeout_seconds ?? 30) * 1000, verifyTls: Boolean(verify_tls),
         },
-      );
+      ));
+      if (credential && res.status === 401) authFailures.set(authKey, [...recentFailures(authKey), Date.now()]);
+      if (credential && res.status !== 401) authFailures.delete(authKey);
       const ms = Date.now() - started;
 
       const type = String(res.headers['content-type'] ?? '');

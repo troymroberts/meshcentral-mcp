@@ -221,7 +221,26 @@ test('mesh_http_request asks for changes (POST, or GET URLs like setConfig/reboo
   assert.equal(await ask({ url: 'http://10.0.0.9/cgi-bin/configManager.cgi?action=setConfig&NTP.Enable=true' }), true);
   assert.equal(await ask({ url: 'http://10.0.0.9/RPC2', method: 'POST' }), true);
   assert.equal(await ask({ url: 'http://10.0.0.9/cgi-bin/configManager.cgi?action=getConfig&name=NTP' }), false);
+  assert.equal(await ask({ url: 'http://10.0.0.9/cgi-bin/log.cgi?action=clear' }), true);
+  assert.equal(await ask({ url: 'http://10.0.0.9/cgi-bin/ptz.cgi?action=start&channel=1&code=Left' }), true);
+  assert.equal(await ask({ url: 'http://10.0.0.9/cgi-bin/log.cgi?action=startFind' }), false);
   cleanup();
+});
+
+test('mesh_http_request stops after 2 rejected logins (lockout guard) and serializes per target', async () => {
+  const dev = await startDevice();
+  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-cred-')), 'c.json');
+  fs.writeFileSync(file, JSON.stringify({ bad: { username: 'api', password: 'wrong' } }));
+  const { call, relays, cleanup } = setup({ credFile: file });
+  const url = `http://127.0.0.1:${dev.port}/digest/x`;
+  const [a, b] = await Promise.all([call('mesh_http_request', { node_id: 'BSL-PC', url, credential: 'bad' }), call('mesh_http_request', { node_id: 'BSL-PC', url, credential: 'bad' })]);
+  assert.match(text(a), /HTTP 401[\s\S]*was rejected/);
+  assert.match(text(b), /HTTP 401/);
+  const n = relays.length;
+  const third = await call('mesh_http_request', { node_id: 'BSL-PC', url, credential: 'bad' });
+  assert.match(text(third), /rejected 2 times[\s\S]*lockout/);
+  assert.equal(relays.length, n, 'no request sent');
+  cleanup(); dev.server.closeAllConnections(); dev.server.close();
 });
 
 test('mesh_port_forward relays local connections to the target and closes cleanly', async () => {
