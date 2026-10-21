@@ -354,7 +354,25 @@ export class MeshCentralClient {
   // Opens a relay to the agent and selects `protocol`:
   //   1 terminal (admin), 5 files, 6 PowerShell (admin), 8 terminal (user), 9 PowerShell (user)
   // `options` are sent as the relay 'options' control message (e.g. terminal cols/rows).
-  async openRelay(nodeid, protocol, { options = null, timeoutMs = 25_000 } = {}) {
+  // The agent occasionally never acts on a tunnel request (no session starts on the
+  // device); a fresh request with a new id then connects normally. So each attempt
+  // waits attemptMs and the request is re-issued, up to `attempts` times.
+  async openRelay(nodeid, protocol, { options = null, timeoutMs = 25_000, attempts = 3, attemptMs = 8_000 } = {}) {
+    const deadline = Date.now() + timeoutMs;
+    let lastError;
+    for (let i = 0; i < attempts && Date.now() < deadline; i++) {
+      const wait = i === attempts - 1 ? deadline - Date.now() : Math.min(attemptMs, deadline - Date.now());
+      try {
+        return await this.#openRelayOnce(nodeid, protocol, options, wait);
+      } catch (err) {
+        lastError = err;
+        if (!err.retryable) throw err;
+      }
+    }
+    throw lastError ?? new Error('Tunnel setup timed out (is the device online and its agent connected?)');
+  }
+
+  async #openRelayOnce(nodeid, protocol, options, timeoutMs) {
     const cookieResp = await this.sendCommand({ action: 'getcookie', nodeid }, 15_000);
     if (!cookieResp.cookie) throw new Error('Server did not return a tunnel auth cookie (unknown device or no access?)');
 
@@ -375,8 +393,11 @@ export class MeshCentralClient {
       };
       const timer = setTimeout(() => {
         cleanup();
+        // terminate() on a still-connecting socket emits 'error'; without a listener
+        // that is an uncaught exception that kills the server process.
+        ws.on('error', () => {});
         try { ws.terminate(); } catch {}
-        reject(new Error('Tunnel setup timed out (is the device online and its agent connected?)'));
+        reject(Object.assign(new Error('Tunnel setup timed out (is the device online and its agent connected?)'), { retryable: true }));
       }, timeoutMs);
       const onMessage = (data) => {
         const s = data.toString();
@@ -386,7 +407,7 @@ export class MeshCentralClient {
         ws.send(String(protocol));
         resolve();
       };
-      const onError = (err) => { cleanup(); reject(new Error(`Tunnel error: ${err.message}`)); };
+      const onError = (err) => { cleanup(); ws.on('error', () => {}); reject(new Error(`Tunnel error: ${err.message}`)); };
       const onClose = () => { cleanup(); reject(new Error('Tunnel closed before setup completed (device offline or access denied?)')); };
       ws.on('message', onMessage);
       ws.on('error', onError);

@@ -5,7 +5,7 @@ import { textResult, deviceResult, errorResult } from '../safety.js';
 
 // RF — remote data read
 export default function register(ctx) {
-  const { define, client, requireNode, resolveNodeId, isWindowsNode, runShell, runConsole, withFileTunnel } = ctx;
+  const { define, client, requireNode, resolveNodeId, runConsole, withFileTunnel } = ctx;
 
   // ════════════════════════════════════════════════════════════════════════
   // RF — remote data read
@@ -19,25 +19,6 @@ export default function register(ctx) {
       const node = await requireNode(node_id);
       const out = await runConsole(node, 'sysinfo');
       return deviceResult(out || '(no response from agent)', `Agent info for ${node.name}:`);
-    },
-  });
-
-  define({
-    name: 'mesh_list_software', tier: 'RF', title: 'List software',
-    description:
-      'Installed software on a device. Runs a read-only OS-appropriate inventory command through the agent ' +
-      '(the native MeshCentral software action is broken on some server versions and is not used).',
-    schema: { node_id: z.string().describe('Device node ID or name (must be online)') },
-    handler: async ({ node_id }) => {
-      const node = await requireNode(node_id);
-      const win = isWindowsNode(node);
-      const cmd = win
-        ? "Get-ItemProperty HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*, " +
-          "HKLM:\\Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\* " +
-          "| Where-Object DisplayName | Select-Object DisplayName,DisplayVersion | Sort-Object DisplayName | Format-Table -AutoSize | Out-String"
-        : "(command -v dpkg-query >/dev/null 2>&1 && dpkg-query -W -f='${Package} ${Version}\\n') || (command -v rpm >/dev/null 2>&1 && rpm -qa) || echo 'No supported package manager found'";
-      const out = await runShell(node, cmd, win ? 2 : 3, 180_000);
-      return deviceResult(out, `Installed software on ${node.name}:`);
     },
   });
 
