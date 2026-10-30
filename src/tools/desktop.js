@@ -4,6 +4,7 @@ import { waitForFrame, vkFor, VK, noFrameMessage, DEFAULT_MAX_WIDTH, FIRST_FRAME
 import { textResult, errorResult, deviceResult } from '../safety.js';
 import { runSequence, MAX_SEQUENCE_STEPS } from '../desktop-sequence.js';
 import { readClipboard } from '../clipboard.js';
+import { listUserSessions, describeSessions, sessionHint } from '../user-sessions.js';
 
 // X — remote desktop (KVM)
 export default function register(ctx) {
@@ -27,8 +28,9 @@ export default function register(ctx) {
       session_id: z.string().optional().describe('Open desktop session to re-capture instead'),
       display: z.number().int().optional().describe('Display/monitor number to capture (one-off only; 65535 = all). Omit for the current one.'),
       max_width: z.number().int().positive().optional().describe('Downscale so width <= this (default 960; pass a larger value (up to native 1920) to read fine print)'),
+      tsid: z.number().int().min(0).optional().describe('Windows session to show (from mesh_desktop_sessions), e.g. a remote-desktop (RDP) user\'s session. One-off only. Omit for the console.'),
     },
-    handler: async ({ node_id, session_id, display, max_width }) => {
+    handler: async ({ node_id, session_id, display, max_width, tsid }) => {
       const maxWidth = max_width ?? DEFAULT_MAX_WIDTH;
       if (session_id) {
         const s = desktops.get(session_id);
@@ -37,7 +39,7 @@ export default function register(ctx) {
         return imageResult(s.encodeJpeg({ maxWidth }), `Desktop (session ${session_id}):`, s);
       }
       if (!node_id) return errorResult('Provide node_id (one-off) or session_id (open session).');
-      const enc = await desktops.screenshot(await resolveNodeId(node_id), { maxWidth, display });
+      const enc = await desktops.screenshot(await resolveNodeId(node_id), { maxWidth, display, tsid });
       return imageResult(enc, `Desktop of ${node_id}:`);
     },
   });
@@ -45,16 +47,23 @@ export default function register(ctx) {
   define({
     name: 'mesh_desktop_open', tier: 'X', title: 'Open desktop session',
     description:
-      'Open an interactive remote-desktop (KVM) session to a device console and return a session_id plus the first ' +
-      'screenshot. Use mesh_desktop_click / _type / _key / _scroll to control it, mesh_desktop_screenshot to re-capture.',
+      'Open an interactive remote-desktop (KVM) session and return a session_id plus the first screenshot. By default ' +
+      'it shows the console; pass tsid (see mesh_desktop_sessions) to attach to another Windows session, such as a ' +
+      'user working over Remote Desktop (RDP), without switching the console. Use mesh_desktop_click / _type / _key / ' +
+      '_scroll to control it, mesh_desktop_screenshot to re-capture.',
     annotations: { destructiveHint: true },
-    confirmSummary: ({ node_id }) => `Open remote desktop control of ${node_id}`,
+    confirmSummary: ({ node_id, tsid }) => `Open remote desktop control of ${node_id}${tsid != null ? ` (Windows session ${tsid})` : ''}`,
     schema: {
       node_id: z.string().describe('Device node ID or name (must be online)'),
       display: z.number().int().optional().describe('Display/monitor number to view (65535 = all). Omit for the primary.'),
+      tsid: z.number().int().min(0).optional().describe('Windows session to show (from mesh_desktop_sessions), e.g. a remote-desktop (RDP) user\'s session. Omit for the console.'),
     },
-    handler: async ({ node_id, display }) => {
-      const session = await desktops.open(await resolveNodeId(node_id));
+    handler: async ({ node_id, display, tsid }) => {
+      const nodeId = await resolveNodeId(node_id);
+      // Ask for the user sessions alongside, to point at an active RDP session when the
+      // console is idle (the classic 'locked screen while the user is on RDP' case).
+      const sessionsP = tsid == null ? listUserSessions(client, nodeId, 4_000) : Promise.resolve(null);
+      const session = await desktops.open(nodeId, { tsid });
       await waitForFrame(session, { requireNew: false, maxMs: FIRST_FRAME_MS });
       if (display != null) { session.setDisplay(display); await waitForFrame(session, { maxMs: 6_000 }); }
       if (!session.hasFrame()) {
@@ -69,7 +78,9 @@ export default function register(ctx) {
         : '';
       // Keep session_id token clean (no trailing punctuation) so callers that parse
       // `session_id=(\S+)` capture only the id.
-      return imageResult(session.encodeJpeg({ maxWidth: DEFAULT_MAX_WIDTH }), `Desktop session opened. session_id=${session.id}${calNote}`, session);
+      const hint = sessionHint(await sessionsP);
+      const where = tsid != null ? ` (Windows session ${tsid})` : '';
+      return imageResult(session.encodeJpeg({ maxWidth: DEFAULT_MAX_WIDTH }), `Desktop session opened${where}. session_id=${session.id}${calNote}${hint}`, session);
     },
   });
 
@@ -269,6 +280,21 @@ export default function register(ctx) {
       s.setDisplay(display);
       await s.capture({ maxMs: 6_000 });
       return imageResult(s.encodeJpeg({ maxWidth: DEFAULT_MAX_WIDTH }), `Switched to display ${display}:`, s);
+    },
+  });
+
+  define({
+    name: 'mesh_desktop_sessions', tier: 'R', title: 'List Windows user sessions',
+    description:
+      'List the Windows user sessions on a device (console and Remote Desktop/RDP), as the Mesh Agent reports them: ' +
+      'tsid, station (Console, RDP-Tcp#N), state (Active, Connected, Disconnected) and user. Pass a tsid to ' +
+      'mesh_desktop_open or mesh_desktop_screenshot to view that session instead of the console.',
+    schema: { node_id: z.string().describe('Device node ID or name (must be online)') },
+    handler: async ({ node_id }) => {
+      const list = await listUserSessions(client, await resolveNodeId(node_id));
+      if (list == null) return errorResult('The agent did not report its user sessions (offline, not Windows, or an older agent).');
+      if (list.length === 0) return textResult('No user sessions reported.');
+      return textResult(`${describeSessions(list)}\n\nThe remote desktop shows the console unless you pass tsid.`);
     },
   });
 

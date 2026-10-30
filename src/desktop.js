@@ -78,9 +78,10 @@ export class DesktopSession {
   #rx = { bin: 0, bytes: 0, text: 0, cmds: {}, ctrl: [] }; // what the agent sent (for no-frame diagnostics)
   #capturing = false;    // a real capture is in flight; the monitor stands down
 
-  constructor({ id, ws, nodeId, idleMs, onExpire, idleFrameMs = 0 }) {
+  constructor({ id, ws, nodeId, idleMs, onExpire, idleFrameMs = 0, tsid = null }) {
     this.id = id;
     this.nodeId = nodeId;
+    this.tsid = Number.isInteger(tsid) ? tsid : null; // Windows session shown (null = console)
     this.#idleFrameMs = idleFrameMs;
     this.createdAt = Date.now();
     this.#ws = ws;
@@ -639,7 +640,7 @@ export class DesktopManager {
 
   list() {
     return [...this.#sessions.values()].map((s) => ({
-      session_id: s.id, node_id: s.nodeId, open: s.isOpen,
+      session_id: s.id, node_id: s.nodeId, open: s.isOpen, tsid: s.tsid ?? null,
       width: s.width, height: s.height, tiles: s.tilesReceived,
       viewers: s.viewers, frame_ms: s.frameMs, rtt_ms: s.rttMs, frame_cost_ms: s.frameCostMs,
       display: s.selectedDisplay, displays: s.displays,
@@ -647,12 +648,14 @@ export class DesktopManager {
     }));
   }
 
-  async open(nodeId) {
+  // tsid: Windows terminal-session id to attach to (see user-sessions.js); omitted =
+  // the agent's default, the console session.
+  async open(nodeId, { tsid } = {}) {
     if (this.#sessions.size >= this.#max) throw new Error(`Too many open desktop sessions (max ${this.#max}). Close one with mesh_desktop_close.`);
-    const ws = await this.#client.openRelay(nodeId, 2, { timeoutMs: DESKTOP_RELAY_TIMEOUT_MS });
+    const ws = await this.#client.openRelay(nodeId, 2, { timeoutMs: DESKTOP_RELAY_TIMEOUT_MS, options: tsidOptions(tsid) });
     const id = `desk_${crypto.randomBytes(5).toString('hex')}`;
     const session = new DesktopSession({
-      id, ws, nodeId, idleMs: this.#idleMs, idleFrameMs: this.#idleFrameMs,
+      id, ws, nodeId, idleMs: this.#idleMs, idleFrameMs: this.#idleFrameMs, tsid,
       onExpire: (s) => { if (this.#sessions.get(s.id) === s) this.#sessions.delete(s.id); },
     });
     this.#sessions.set(id, session);
@@ -661,7 +664,7 @@ export class DesktopManager {
 
   // Stateless single screenshot: open, wait for a settled frame, encode, close.
   async screenshot(nodeId, opts = {}) {
-    const ws = await this.#client.openRelay(nodeId, 2, { timeoutMs: DESKTOP_RELAY_TIMEOUT_MS });
+    const ws = await this.#client.openRelay(nodeId, 2, { timeoutMs: DESKTOP_RELAY_TIMEOUT_MS, options: tsidOptions(opts.tsid) });
     const session = new DesktopSession({ id: 'oneshot', ws, nodeId, idleMs: 60_000, onExpire: () => {} });
     try {
       if (opts.display != null) session.setDisplay(opts.display);
@@ -684,6 +687,12 @@ export class DesktopManager {
 }
 
 // Explain a missing frame using what the agent actually reported, if anything.
+// The KVM's connection options: MeshCentral's viewer sends { type:'options', tsid } on the
+// control channel before the protocol number; the agent then captures that session.
+export function tsidOptions(tsid) {
+  return Number.isInteger(tsid) && tsid >= 0 ? { tsid } : null;
+}
+
 export function noFrameMessage(session) {
   const notices = session.takeNotices();
   const said = notices.map((n) => n.text).filter(Boolean).join('; ');

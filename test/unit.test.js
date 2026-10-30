@@ -335,3 +335,54 @@ test('openRelay marks our relay side browser=1 and keeps it off the agent reques
     await new Promise((r) => wss.close(r));
   }
 });
+
+// ── Windows user sessions (KVM attach to an RDP session) ─────────────────────
+test('normalizeSessions: agent userSessions data -> sorted list with console/remote flags', async () => {
+  const { normalizeSessions } = await import('../src/user-sessions.js');
+  const list = normalizeSessions({
+    3: { SessionId: 3, StationName: 'Console', State: 'Connected' },
+    1: { SessionId: 1, StationName: 'RDP-Tcp#0', State: 'Active', Username: 'Admin', Domain: 'PC1' },
+  });
+  assert.deepEqual(list.map((s) => s.tsid), [1, 3]);
+  assert.equal(list[0].user, 'PC1\\Admin');
+  assert.equal(list[0].remote, true);
+  assert.equal(list[1].console, true);
+  assert.deepEqual(normalizeSessions(null), []);
+});
+
+test('sessionHint: points at an active RDP session only when the console has no active user', async () => {
+  const { normalizeSessions, sessionHint } = await import('../src/user-sessions.js');
+  const rdpOnly = normalizeSessions({
+    1: { SessionId: 1, StationName: 'RDP-Tcp#0', State: 'Active', Username: 'Admin' },
+    3: { SessionId: 3, StationName: 'Console', State: 'Connected' },
+  });
+  assert.match(sessionHint(rdpOnly), /tsid=1/);
+  const consoleUser = normalizeSessions({ 1: { SessionId: 1, StationName: 'Console', State: 'Active', Username: 'A' } });
+  assert.equal(sessionHint(consoleUser), '');
+  assert.equal(sessionHint(null), '');
+});
+
+test('openRelay sends the KVM tsid option on the control channel before the protocol', async () => {
+  const { MeshCentralClient } = await import('../src/mesh-client.js');
+  const { tsidOptions } = await import('../src/desktop.js');
+  const { WebSocketServer } = await import('ws');
+  assert.equal(tsidOptions(undefined), null);
+  assert.equal(tsidOptions(-1), null);
+  assert.deepEqual(tsidOptions(1), { tsid: 1 });
+  const wss = new WebSocketServer({ port: 0 });
+  const got = [];
+  wss.on('connection', (sock) => { sock.on('message', (d) => got.push(d.toString())); sock.send('c'); });
+  const client = new MeshCentralClient({ serverUrl: `http://127.0.0.1:${wss.address().port}/`, username: 'u', password: 'p' });
+  client.sendCommand = async () => ({ cookie: 'k' });
+  client.sendRaw = async () => {};
+  try {
+    const ws = await client.openRelay('node//x', 2, { attemptMs: 2000, timeoutMs: 5000, options: tsidOptions(1) });
+    await new Promise((r) => setTimeout(r, 100));
+    assert.deepEqual(JSON.parse(got[0]), { ctrlChannel: '102938', type: 'options', tsid: 1 });
+    assert.equal(got[1], '2', 'protocol number follows the options');
+    ws.close();
+  } finally {
+    for (const s of wss.clients) s.terminate();
+    await new Promise((r) => wss.close(r));
+  }
+});
