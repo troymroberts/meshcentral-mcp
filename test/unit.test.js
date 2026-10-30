@@ -310,3 +310,28 @@ test('openRelay re-issues the tunnel request when the agent never connects, with
     await new Promise((r) => wss.close(r));
   }
 });
+
+// Regression guard: our relay side must carry browser=1 (MeshCentral's desktop
+// multiplexor treats a peer without it as the agent, so the viewer never pairs and
+// setup times out). It was lost once in a merge; the agent's side must NOT carry it.
+test('openRelay marks our relay side browser=1 and keeps it off the agent request', async () => {
+  const { MeshCentralClient } = await import('../src/mesh-client.js');
+  const { WebSocketServer } = await import('ws');
+  const wss = new WebSocketServer({ port: 0 });
+  const urls = [];
+  wss.on('connection', (sock, req) => { urls.push(req.url); sock.send('c'); });
+  const client = new MeshCentralClient({ serverUrl: `http://127.0.0.1:${wss.address().port}/`, username: 'u', password: 'p' });
+  const sent = [];
+  client.sendCommand = async () => ({ cookie: 'k' });
+  client.sendRaw = async (m) => { sent.push(m); };
+  try {
+    const ws = await client.openRelay('node//x', 2, { attemptMs: 2000, timeoutMs: 5000 });
+    assert.match(urls[0], /[?&]browser=1(&|$)/, 'our side carries browser=1');
+    const agent = sent.find((m) => m.type === 'tunnel');
+    assert.ok(agent && !/browser=1/.test(agent.value), 'the agent request does not');
+    ws.close();
+  } finally {
+    for (const s of wss.clients) s.terminate();
+    await new Promise((r) => wss.close(r));
+  }
+});
