@@ -62,6 +62,9 @@ Diagnostic workflow for a device:
    and the notes left by technicians or by this server ("[MCP note]" entries) -
    what was found and done before. mesh_get_device says whether it is online and
    when it last connected; do not run a command just to find that out.
+   If the server has the mcpnotes plugin, also read the team's notes:
+   mesh_notes_for_device (device note, client index, who logs on to it), and
+   mesh_notes_client / mesh_notes_for_user for company- or user-level work.
 2. Use the built-in read-only diagnostics before writing scripts (no approval
    needed): mesh_health_check (flags problems; node_ids for several devices),
    mesh_event_log (Windows event logs / Linux journal by level, window, source,
@@ -70,6 +73,8 @@ Diagnostic workflow for a device:
    persistent terminal (see below).
 4. When you finish, record what you found, what you changed and what is still
    open with mesh_log_event, so the next session can read it. Keep it factual.
+   With mcpnotes, also add a dated entry with mesh_notes_append to the device
+   note (and the user/client note when relevant). Never record secrets.
 
 Running commands - one at a time per device:
 - The Mesh Agent executes only ONE mesh_run_command at a time per device; this

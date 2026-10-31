@@ -1,0 +1,7 @@
+{
+  "name": "meshcentral-mcpnotes",
+  "version": "0.1.0",
+  "private": true,
+  "type": "commonjs",
+  "description": "MeshCentral plugin: server-side Markdown notes for the MeshCentral MCP"
+}
