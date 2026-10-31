@@ -18,13 +18,16 @@
 // not by file name. The agent hook records logons so "seen on" devices come from
 // MeshCentral, and are compared with the devices the note itself lists.
 //
-// Access:
+// Access (every permission is denied by default; grant them to staff in Plugins → permissions):
 //   full site admin                    everything
+//   can_read permission                needed for anything but whoami, on top of rights:
+//     + rights on a device             notes linked to that device (nodeid)
+//     + rights on any group of a client every note in that client's folder
 //   can_read_all permission            every note (read)
-//   rights on a device                 notes linked to that device (nodeid)
-//   rights on any group of a client    every note in that client's folder
 //   can_write permission               create/update notes the user can read
-//   can_manage permission / site admin delete notes, map clients to groups
+//   can_manage permission              delete/merge notes, map clients to groups
+// Group rights alone are not enough: client staff often have accounts on their own
+// groups, and these notes are written for the support team.
 
 module.exports.mcpnotes = function mcpnotesPlugin(pluginHandler) {
     const lib = require('./lib/notes');
@@ -34,7 +37,8 @@ module.exports.mcpnotes = function mcpnotesPlugin(pluginHandler) {
     let writeQueue = Promise.resolve();
 
     const PERMISSIONS = {
-        can_write: { title: 'Write notes', desc: 'Create and update notes for clients and devices the user can access.', default: 'allowed' },
+        can_read: { title: 'Read notes', desc: 'Read support notes for the clients and devices the user has rights on. Grant to support staff only.', default: 'denied' },
+        can_write: { title: 'Write notes', desc: 'Create and update notes the user can read.', default: 'denied' },
         can_read_all: { title: 'Read all notes', desc: 'Read every note, including shared notes outside client folders.', default: 'denied' },
         can_manage: { title: 'Manage notes', desc: 'Delete notes and map client folders to device groups.', default: 'denied' },
     };
@@ -100,6 +104,7 @@ module.exports.mcpnotes = function mcpnotesPlugin(pluginHandler) {
         const perm = await permissions(user);
         const admin = isFullAdmin(user);
         const readAll = admin || perm('can_read_all');
+        const canUse = readAll || perm('can_read');
         const clientCache = new Map();
         const nodeCache = new Map();
 
@@ -118,10 +123,11 @@ module.exports.mcpnotes = function mcpnotesPlugin(pluginHandler) {
         }
         async function canRead(path, nodeid) {
             if (readAll) return true;
+            if (!canUse) return false;
             return (await nodeReadable(nodeid)) || (await clientReadable(lib.clientOf(path)));
         }
         return {
-            domain, user, admin, readAll, canRead, clientReadable,
+            domain, user, admin, readAll, canUse, canRead, clientReadable,
             // Device lists follow MeshCentral rights only; can_read_all covers notes, not devices.
             meshVisible: (meshid) => admin || meshAccessible(user, meshid),
             canWrite: async (path, nodeid) => (admin || perm('can_write')) && canRead(path, nodeid),
@@ -518,7 +524,11 @@ module.exports.mcpnotes = function mcpnotesPlugin(pluginHandler) {
         }
         const op = ops[command.op];
         accessFor(session)
-            .then((access) => op(command, session, access))
+            .then((access) => {
+                // Group or device rights alone never reach notes (or the logon data).
+                if (command.op !== 'whoami' && !access.canUse) throw new Error('no access to notes: needs the "Read notes" permission (Plugins → MCP Notes permissions)');
+                return op(command, session, access);
+            })
             .then((result) => reply(session, command, true, result, null))
             .catch((err) => {
                 if (!/^(conflict|note not found|no |invalid|path|body|text|query|client|revision|deleting|mapping|merging|notes can|from and)/.test(err.message || '')) log(`op ${command.op} failed`, err);

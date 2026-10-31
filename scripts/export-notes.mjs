@@ -30,7 +30,13 @@ if (fs.existsSync(dir) && fs.readdirSync(dir).length && !fs.existsSync(marker)) 
 loadDotEnv();
 const config = loadConfig();
 if (config.error) { console.error(config.error); process.exit(1); }
-const client = new MeshCentralClient(config);
+// Same mapping as src/index.js: loadConfig() nests the credentials.
+const client = new MeshCentralClient({
+  serverUrl: config.serverUrl,
+  username: config.credentials.username,
+  password: config.credentials.password,
+  rejectUnauthorized: config.rejectUnauthorized,
+});
 await client.connect();
 
 async function call(op, a) {
