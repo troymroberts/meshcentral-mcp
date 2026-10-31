@@ -91,19 +91,31 @@ last revision kept in history.
 
 ## Access
 
+Every plugin permission is **denied by default**. Grant them to your support staff (or a
+staff user group) under My Server → Plugins → MCP Notes permissions.
+
 | Who | Can |
 |---|---|
 | Full site admin | everything |
-| `can_read_all` permission | read every note |
-| Rights on a device | read notes linked to that device |
-| Rights on **any** device group mapped to a client folder | read every note in that folder |
-| `can_write` permission (default: allowed) | create/update notes the user can read |
-| `can_manage` permission | delete notes, map client folders to groups |
+| `can_read` + rights on a device | read notes linked to that device |
+| `can_read` + rights on **any** device group mapped to a client folder | read every note in that folder |
+| `can_read_all` | read every note |
+| `can_write` | create/update notes the user can read |
+| `can_manage` | delete/merge notes, map client folders to groups |
+
+**Group rights alone are never enough.** Client staff often have MeshCentral accounts on
+their own company's groups, and a websocket message can be sent from any logged-in
+browser. Without `can_read`, every operation except `whoami` is refused before any
+data is read, including the logon history.
 
 A client folder belongs to nobody until an admin maps it (`setclient`, or the MCP's
 `mesh_notes_map_client`). Unmapped folders and top-level notes are admin-only (or
 `can_read_all`). When a user may not read a note, the plugin says "not found", so paths
-cannot be probed. On a MeshCentral without the plugin-permissions API, the defaults apply.
+cannot be probed. On a MeshCentral without the plugin-permissions API, the defaults
+apply, which means admins only.
+
+*0.1.0 → 0.2.0:* 0.1.0 let group rights alone read notes and allowed writes by default.
+0.2.0 adds `can_read` and denies every permission by default.
 
 ## Operations
 
@@ -140,7 +152,9 @@ simultaneous `append`s on different peers could lose one.
    zip needs explicit directory entries (`scripts/package-mcpnotes.sh` adds them); **Upgrade
    downloads the `downloadUrl` stored in the DB at install time**, so keep the URL stable
    (it is: `plugin/release-assets/MeshCentral-MCPNotes.zip` on master).
-5. Map the client folders to their device groups (`mesh_notes_map_client`, admin profile).
+5. Grant `can_read` (and `can_write` as needed) to support staff in the plugin's permissions
+   screen; leave client accounts without them. Then map the client folders to their device
+   groups (`mesh_notes_map_client`, admin profile).
 6. Import the local notes: `node scripts/import-notes.mjs <notes-folder>` (dry run), then `--apply`.
    Files that look like they hold a secret are skipped; review them, then pass `--allow <path>`.
 7. From then on the server is the source of truth; there is no two-way sync. Switch the local

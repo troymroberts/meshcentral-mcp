@@ -14,7 +14,7 @@ const MAIL_NODE = 'node//MailNodeAAAAAAAAAAAAAAAAAAAAAAAA';
 const CAM_NODE = 'node//CameraNodeBBBBBBBBBBBBBBBBBBBBBB';
 const TERM_NODE = 'node//TermNodeCCCCCCCCCCCCCCCCCCCCCCCCCC';
 
-function fakeServer() {
+function fakeServer({ permissionsApi = true } = {}) {
   const store = new Map();
   // Device records as MeshCentral keeps them (users = who is logged on now).
   for (const n of [
@@ -40,7 +40,13 @@ function fakeServer() {
       cb(ok ? { _id: nodeid } : null, ok ? 0xFFFF : 0, Boolean(ok));
     }),
   };
-  const plugin = mcpnotes({ parent: { db, webserver } });
+  // MeshCentral's plugin-permission API: users here carry the permissions granted to them.
+  const handler = { parent: { db, webserver } };
+  if (permissionsApi) {
+    handler.registerPermissions = () => {};
+    handler.getAccessPermissions = async (name, user) => (p) => (p === '_ALL_' ? user.perms || [] : (user.perms || []).includes(p));
+  }
+  const plugin = mcpnotes(handler);
   let seq = 0;
   const call = (user, op, args = {}) => new Promise((resolve) => {
     const responseid = `r${++seq}`;
@@ -53,8 +59,11 @@ function fakeServer() {
 }
 
 const admin = { _id: 'user//admin', name: 'admin', siteadmin: 0xFFFFFFFF };
-const acmeTech = { _id: 'user//acmetech', name: 'acmetech', siteadmin: 0, meshes: [ACME_MESH] };
-const camOnly = { _id: 'user//camonly', name: 'camonly', siteadmin: 0, nodes: [CAM_NODE] };
+const acmeTech = { _id: 'user//acmetech', name: 'acmetech', siteadmin: 0, meshes: [ACME_MESH], perms: ['can_read', 'can_write'] };
+const camOnly = { _id: 'user//camonly', name: 'camonly', siteadmin: 0, nodes: [CAM_NODE], perms: ['can_read', 'can_write'] };
+// Client staff: full rights on their own group, no notes permissions.
+const acmeStaff = { _id: 'user//staff', name: 'staff', siteadmin: 0, meshes: [ACME_MESH], nodes: [TERM_NODE] };
+const acmeReader = { _id: 'user//reader', name: 'reader', siteadmin: 0, meshes: [ACME_MESH], perms: ['can_read'] };
 
 async function seed(call) {
   await call(admin, 'setclient', { client: 'ACME', meshids: [ACME_MESH] });
@@ -268,4 +277,45 @@ test('linkedPaths resolves relative links; demoteHeadings nests merged text', ()
     ['acme/devices/acme-ts.md', 'acme/servers.md']);
   assert.equal(lib.demoteHeadings('# a\n## b\n###### c\nno #tag'), '### a\n#### b\n###### c\nno #tag');
   assert.equal(lib.setMeta('# t\n', { email: 'a@b.c', aliases: ['x'] }), '---\nemail: a@b.c\naliases: x\n---\n# t\n');
+});
+
+// ── permissions (0.2.0): group rights alone never reach notes ───────────
+
+test('client staff with group and device rights but no notes permission get nothing', async () => {
+  const { call, plugin, settle } = fakeServer();
+  await seed(call);
+  plugin.hook_processAgentData({ action: 'coreinfo', users: ['ACME\\jsmith'] }, { dbNodeKey: TERM_NODE, dbMeshKey: ACME_MESH, domain: { id: '' } });
+  await settle();
+  for (const [op, args] of [
+    ['list', {}], ['get', { path: 'ACME/servers.md' }], ['search', { query: 'acme' }], ['fornode', { nodeid: TERM_NODE }],
+    ['client', { client: 'ACME' }], ['history', { path: 'ACME/servers.md' }], ['clients', {}],
+    ['append', { path: 'ACME/servers.md', text: '- x' }], ['put', { path: 'ACME/new.md', baseRev: 0, body: 'x' }],
+  ]) {
+    const r = await call(acmeStaff, op, args);
+    assert.equal(r.ok, false, `${op} must be refused`);
+    assert.match(r.error, /needs the "Read notes" permission/, op);
+    assert.equal(r.result, null, `${op} returns no data`);
+  }
+  const who = await call(acmeStaff, 'whoami');
+  assert.equal(who.ok, true);
+  assert.deepEqual(who.result.permissions, []);
+});
+
+test('can_read without can_write reads but cannot change notes', async () => {
+  const { call } = fakeServer();
+  await seed(call);
+  assert.equal((await call(acmeReader, 'get', { path: 'ACME/servers.md' })).ok, true);
+  const w = await call(acmeReader, 'append', { path: 'ACME/servers.md', text: '- x' });
+  assert.equal(w.ok, false);
+  assert.match(w.error, /no write access/);
+  assert.equal((await call(acmeReader, 'get', { path: 'GLOBEX/devices/camera.md' })).ok, false, 'can_read is still bounded by rights');
+});
+
+test('without the plugin-permissions API every default is denied: admins only', async () => {
+  const { call } = fakeServer({ permissionsApi: false });
+  await seed(call);
+  const r = await call(acmeTech, 'list');
+  assert.equal(r.ok, false);
+  assert.match(r.error, /Read notes/);
+  assert.equal((await call(admin, 'list')).result.notes.length, 4);
 });
