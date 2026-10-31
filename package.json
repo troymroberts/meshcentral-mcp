@@ -9,7 +9,7 @@
   },
   "scripts": {
     "start": "node src/index.js",
-    "test": "node --test test/unit.test.js test/desktop.test.js test/sequence.test.js test/readonly.test.js test/tools.test.js test/network.test.js",
+    "test": "node --test test/unit.test.js test/desktop.test.js test/sequence.test.js test/readonly.test.js test/tools.test.js test/network.test.js test/mcpnotes-plugin.test.js test/notes-tools.test.js",
     "test:integration": "node --test test/integration.test.js"
   },
   "dependencies": {

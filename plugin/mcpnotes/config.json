@@ -1,0 +1,17 @@
+{
+  "name": "MCP Notes",
+  "shortName": "mcpnotes",
+  "version": "0.1.0",
+  "author": "troymroberts",
+  "description": "Server-side Markdown notes about clients, devices and users for the MeshCentral MCP. No web UI; reached over the control websocket.",
+  "hasAdminPanel": false,
+  "homepage": "https://github.com/troymroberts/meshcentral-mcp/tree/master/plugin/mcpnotes",
+  "changelogUrl": "https://github.com/troymroberts/meshcentral-mcp/commits/master/plugin/mcpnotes",
+  "configUrl": "https://raw.githubusercontent.com/troymroberts/meshcentral-mcp/master/plugin/mcpnotes/config.json",
+  "downloadUrl": "https://raw.githubusercontent.com/troymroberts/meshcentral-mcp/master/plugin/release-assets/MeshCentral-MCPNotes.zip",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/troymroberts/meshcentral-mcp.git"
+  },
+  "meshCentralCompat": ">=1.2.5"
+}
